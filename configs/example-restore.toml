@@ -1,6 +1,6 @@
 # Example restore configuration with glob pattern matching
 # install.sh installs this as configs/restore.toml (only when that file doesn't exist yet).
-# Try it with 'snap restore --dry-run' before the first real restore.
+# Try it with 'molt restore --dry-run' before the first real restore.
 
 [tar]
 # Select which archives to restore (the [tar.<name>] names from capture.toml):
@@ -38,7 +38,7 @@ archives = [
 # [age]
 # identity = "~/.config/age/key.txt"
 
-# Scripts to run before/after the restore, with 'snap restore --run-scripts'.
+# Scripts to run before/after the restore, with 'molt restore --run-scripts'.
 # They run in the snapshot directory, so restore-brew.sh finds the captured Brewfile
 [scripts]
 # before = ["scripts/pre-restore.sh"]

@@ -4,7 +4,7 @@ import pytest
 
 
 def pytest_collection_modifyitems(items):
-    """Mark tests that run snap.py in a subprocess (through the env fixture) as slow.
+    """Mark tests that run molt.py in a subprocess (through the env fixture) as slow.
 
     ./check.sh --fast runs pytest with -m "not slow" to skip them. test_install.py marks
     itself.

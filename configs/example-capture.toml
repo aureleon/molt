@@ -1,6 +1,6 @@
 # Example capture configuration
 # install.sh installs this as configs/capture.toml (only when that file doesn't exist yet).
-# Try it with 'snap capture --dry-run' before the first real capture.
+# Try it with 'molt capture --dry-run' before the first real capture.
 
 # Each [tar.<name>] table becomes one archive, <name>.tar.gz, in the snapshot.
 
@@ -105,8 +105,14 @@ exclude = [
 #     "nginx/*.log",    # All logs in nginx subdirectory
 # ]
 
-# Scripts to run before/after the capture, with 'snap capture --run-scripts'.
-# Paths are relative to the snap root; after scripts run in the new snapshot directory,
+# Save a draft install.toml of what is installed (Homebrew, App Store apps, mise, npm,
+# cargo, uv, VS Code, other apps) in the snapshot; on a new machine, review it, then
+# 'molt install -t <snapshot>/install.toml'
+# [install]
+# draft = true
+
+# Scripts to run before/after the capture, with 'molt capture --run-scripts'.
+# Paths are relative to the molt root; after scripts run in the new snapshot directory,
 # so capture-brew.sh saves the Brewfile in the snapshot
 [scripts]
 # before = ["scripts/dump-database.sh"]

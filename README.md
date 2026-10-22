@@ -1,51 +1,42 @@
-# snap.py
+# molt
 
-Capture files in tar archives, then restore them locally or on another machine over SSH.
-Each snapshot includes metadata and SHA-256 checksums.
+Moves a machine's setup to another one. molt captures files into tar archives (a
+*snapshot*), restores them locally or on another machine over SSH, and installs the packages
+and apps the new machine is missing. Every snapshot has a `snapshot.toml` with SHA-256
+checksums of its archives, so a restore only extracts what it can verify.
 
-snap.py supports per-archive encryption, backups of replaced files, and optional scripts.
-Snapshots are full captures, not incremental backups.
+Snapshots are full captures, not incremental backups. On top of that, molt can encrypt
+archives with [age](https://age-encryption.org), back up every file a restore replaces, and
+run your own scripts before and after a capture or restore.
 
 ## Requirements
 
-- Python 3.11+ (`python3` on `PATH`). Restore requires Python 3.11.4+ for the tar extraction filter.
-- SSH and rsync for remote operations.
-- sudo for restore targets that need root access.
-- Optional: `tqdm` for progress bars and [age](https://age-encryption.org) for encryption.
-
-Remote hosts need Python and rsync too.
+- Python 3.11+ as `python3` (restore needs 3.11.4+ for the tar extraction filter)
+- SSH and rsync for anything remote, on both ends (hosts need Python 3.11+ too)
+- sudo, only when a restore target needs root
+- Optional: `tqdm` for progress bars, and age for encryption
 
 ## Installation
 
-From a checkout of this repository, run:
+From a checkout of this repo:
 
 ```bash
-./install.sh
+./install.sh          # asks where the command goes
+./install.sh --yes    # no prompts: ~/.molt, and the command in ~/.local/bin
 ```
 
-For an install without prompts, run:
+The installer creates `~/.molt/` with example configs, installs rsync and tqdm when they are
+missing, and links `molt` into the bin dir. Re-running it updates `molt.py`, but never
+overwrites a config or script you already have. If another `molt` is already on `PATH`, the
+command is named `molt-cli` instead.
 
-```bash
-./install.sh --yes
-```
+For a root somewhere else, run `./install.sh /path/to/root`, then pass `-r /path/to/root`
+to each command. See [installation](docs/usage.md#installation) for the other options.
 
-The installer creates `~/.snap/` and installs the command in `~/.local/bin` by default.
-It installs rsync and optional progress bars, but keeps existing configs and scripts.
-If another program uses the name `snap`, the installer names the command `snaps`.
+## Capture and restore
 
-### Custom Installation Directory
-
-```bash
-./install.sh /path/to/custom/location
-```
-
-With a custom snap root, pass `-r /path/to/custom/location` to each command.
-See the [installation details](docs/usage.md#installation) for installer options and manual installation.
-
-## Quick start
-
-The installer adds example configs to `~/.snap/configs/`. For a small first capture,
-set `~/.snap/configs/capture.toml` to:
+`~/.molt/configs/capture.toml` says what to capture. Each `[tar.<name>]` table becomes one
+archive, e.g. a small first capture:
 
 ```toml
 [tarball]
@@ -58,94 +49,100 @@ root = "$HOME"
 files = [".bashrc", ".gitconfig"]
 ```
 
-This creates one archive named `dotfiles`. Use paths that exist on your machine.
-See [configuration](docs/configuration.md) for directories, excludes, and other options.
+Then preview it, and capture:
 
-1. Preview the capture:
+```bash
+molt capture --dry-run
+molt capture
+```
 
-   ```bash
-   snap capture --dry-run
-   ```
+Snapshots go in `~/.molt/captures/YYYY/MM-DD/<id>/`. A `./.molt/` in the current directory
+takes priority over `~/.molt/`, and `-r` picks any other root.
 
-2. Create the snapshot:
-
-   ```bash
-   snap capture
-   ```
-
-Snapshots go in `~/.snap/captures/YYYY/MM-DD/<id>/`.
-Each snapshot contains the archives and `snapshot.toml`.
-A local `./.snap/` takes priority over `~/.snap/`. Use `-r` to select another snap root.
-
-### Restore
-
-**CAUTION: Restore replaces files at the roots recorded in the snapshot. Only restore snapshots that you trust.**
-
-Set `~/.snap/configs/restore.toml` to select that archive:
+`~/.molt/configs/restore.toml` selects the archives to restore, by name or glob:
 
 ```toml
 [tar]
 archives = ["dotfiles"]
 ```
 
-1. Preview the latest snapshot:
-
-   ```bash
-   snap restore --dry-run
-   ```
-
-2. Restore the snapshot:
-
-   ```bash
-   snap restore
-   ```
-
-By default, restore moves existing files into backup directories before extraction.
-See [rollback protection](docs/usage.md#rollback-protection) for backup locations and recovery behavior.
-
-## Remote use
-
-Use `--to` to send a capture to a host or to restore on a host:
-
 ```bash
-snap capture --to user@host
-snap restore --to user@host --dry-run
+molt restore --dry-run    # the latest snapshot
+molt restore
 ```
 
-Use `--from` to capture on a host or restore a snapshot from one:
+Note, a restore replaces files at the roots recorded in the snapshot, so only restore
+snapshots you trust. By default the files it replaces are moved into a backup dir first
+(`$HOME.bak/dotfiles/` for the example above), and a failed archive is rolled back. See
+[rollback protection](docs/usage.md#rollback-protection) for where backups go.
+
+## Remote hosts
+
+`--from` captures on a host or restores a snapshot from one, and `--to` sends a capture to a
+host or restores on one:
 
 ```bash
-snap capture --from user@host
-snap restore --from user@host --dry-run
+molt capture --from user@host
+molt capture --to user@host
+molt restore --from user@host --dry-run
+molt restore --to user@host --dry-run
+molt migrate --to user@host    # capture here, restore there
 ```
 
-Remote operations require SSH access, Python 3.11+, and rsync on the host.
-See [remote usage](docs/usage.md#usage) for migration, host paths, and other examples.
+molt copies itself and the config to the host for the run, and removes them after. See
+[usage](docs/usage.md#usage) for host paths, remote roots, and remote to remote.
+
+## Installing packages and apps
+
+`molt install` installs what `~/.molt/configs/install.toml` lists and the machine doesn't
+have yet: Homebrew taps, formulae, and casks, App Store apps, mise runtimes, npm, cargo, and
+uv tools, and VS Code extensions. Anything else goes in a `[[custom]]` entry as a shell
+`check` and `install` command. Apps that only IT or a vendor's installer can provide go in
+`[[manual]]`, which molt only checks for, and lists at the end of a run with where to get
+them.
+
+Rather than writing the list by hand, start from a draft of what this machine has:
+
+```bash
+molt install --draft ~/.molt/configs/install.toml
+molt install --status     # what is missing, and what is installed but not listed
+molt install --dry-run
+molt install
+```
+
+It never upgrades what is already installed, and only retries what is still missing, so
+re-running it is safe. With `[install] draft = true` in capture.toml, every capture also saves
+a draft `install.toml` in the snapshot, for the next machine.
+
+For now install covers macOS. Linux package managers (apt, dnf, pacman, and friends) are TODO,
+but `[[custom]]` entries already work there.
+
+See [install.toml](docs/configuration.md#installtoml) and
+[installing packages](docs/usage.md#install-packages-and-apps) for every section and option.
 
 ## Common commands
 
-| Task | Command |
-| --- | --- |
-| List snapshots and backup directories | `snap list` |
-| Restore a specific snapshot | `snap restore --from /path/to/snapshot` |
-| Capture on a remote host | `snap capture --from user@host` |
-| Send a local capture to a remote host | `snap capture --to user@host` |
-| Restore on a remote host | `snap restore --to user@host` |
-| Capture locally, then restore remotely | `snap migrate --to user@host` |
-| Preview deletion of older snapshots | `snap prune --keep 5 --dry-run` |
-| Run the scripts in the config | `snap capture --run-scripts` |
-| Show command options | `snap restore --help` |
+```bash
+molt list                              # snapshots, and the backup dirs of their roots
+molt prune --keep 5 --dry-run          # what pruning to the newest 5 would delete
+molt restore --from <snapshot dir>     # a specific snapshot instead of the latest
+molt capture --run-scripts             # also run the config's before/after scripts
+molt install --brewfile Brewfile       # the [brew] and [mas] items as a Brewfile
+molt <command> --help
+```
 
-Restore and migrate can replace files. Preview them with `--dry-run` before a real run.
-Scripts run only with `--run-scripts`.
+Every command except `list` and `check` takes `--dry-run`. A dry run still does the read-only
+parts (configs, checksums, what is installed), and shows each command it skips.
 
 ## Encryption
 
-Set `encrypt = true` for an archive and add age recipients to the capture config.
-Restore needs an age identity file. Snapshot metadata remains unencrypted.
-See [encryption](docs/configuration.md#encryption) for examples and remote requirements.
+Set `encrypt = true` on an archive and add your age recipients to capture.toml. A restore then
+needs your age identity file, which never leaves the machine it is on. Note, `snapshot.toml`
+itself stays unencrypted. See [encryption](docs/configuration.md#encryption).
 
 ## Documentation
 
-- [Usage and options](docs/usage.md): installation details, local and remote use, flags, backups, troubleshooting, and development.
-- [Configuration](docs/configuration.md): TOML examples, globs, excludes, encryption, and symlinks.
+- [Usage and options](docs/usage.md): installation, local and remote use, every flag, backups,
+  troubleshooting, and development
+- [Configuration](docs/configuration.md): capture, restore, migrate, and install configs, globs,
+  excludes, encryption, and symlinks

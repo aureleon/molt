@@ -1,0 +1,83 @@
+# Example install configuration
+# install.sh installs this as configs/install.toml (only when that file doesn't exist yet).
+# 'molt install --status' shows what is missing; 'molt install --dry-run' shows what a real
+# run would install. To start from what this machine has: molt install --draft draft.toml
+
+# Sections install in this order unless [install] order sets another: brew, mas, custom,
+# mise, npm, cargo, uv, vscode, manual. Nothing already installed is upgraded. Sections
+# left out of 'order' follow it, in that order.
+# [install]
+# order = ["custom", "brew"]   # e.g. when a [[custom]] entry installs Homebrew itself
+
+# Homebrew: installed with 'brew bundle install --no-upgrade'. A cask whose app is already
+# in /Applications is adopted. 'molt install --brewfile Brewfile' writes these as a Brewfile
+[brew]
+taps = []
+formulae = [
+    "git",
+    "jq",
+    "ripgrep",
+]
+casks = [
+    "rectangle",
+    "visual-studio-code",
+]
+
+# Mac App Store apps, by name and id (the number in the app's App Store URL). They
+# install with mas through brew bundle, so the App Store must be signed in
+[mas.apps]
+# Xcode = 497799835
+
+# Runtimes, with mise. global = true makes them the global versions ('mise use
+# --global'; the first version of a list is the default); false only installs them
+[mise]
+global = true
+
+[mise.tools]
+node = "lts"
+python = ["3.12"]
+
+# Global npm packages; without npm on PATH they install through 'mise exec'
+# [npm]
+# packages = ["typescript"]
+
+# Crates for 'cargo install', and Python tools for 'uv tool install'
+# [cargo]
+# crates = ["cargo-edit"]
+# [uv]
+# tools = ["ruff"]
+
+# VS Code extensions, by id (the 'code' command, or the one inside the app)
+[vscode]
+extensions = [
+    "ms-python.python",
+]
+
+# Anything else: shell commands, run with bash. 'check' exits 0 when it is installed.
+# With 'items', each item is checked and installed on its own, with {item} in the commands
+# replaced by the item; a 'list' command that prints the installed items, one a line,
+# replaces the checks (and shows what isn't in the config). 'requires' skips the entry
+# while that command is missing. Install commands keep the terminal, so they can prompt
+
+# An installer script
+# [[custom]]
+# name = "rustup"
+# check = "command -v rustup"
+# install = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path"
+
+# A list of things one tool installs
+# [[custom]]
+# name = "rust targets"
+# requires = "rustup"
+# items = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+# list = "rustup target list --installed"
+# install = "rustup target add {item}"
+
+# Things to install by hand: apps your company's device management installs, or
+# installers with no cask. They are only checked, by 'app' (in /Applications or
+# ~/Applications, or a path) or a 'check' command, and listed at the end of an install
+# run with their source, url and note
+# [[manual]]
+# name = "Slack"
+# app = "Slack.app"
+# source = "Self Service"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Snapshot and restore utility.
+Snapshot and restore utility: molt captures a machine's files into snapshots, restores
+them, and installs the packages and apps the machine needs.
 """
 
 __version__ = "0.1"
@@ -10,7 +11,7 @@ import sys
 # Require Python 3.11+ for tomllib
 if sys.version_info < (3, 11):
     print(
-        f"Error: snap.py requires Python 3.11 or later (found {sys.version.split()[0]})",
+        f"Error: molt.py requires Python 3.11 or later (found {sys.version.split()[0]})",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -23,6 +24,7 @@ import hashlib
 import json
 import os
 import platform
+import plistlib
 import re
 import select
 import shlex
@@ -77,7 +79,7 @@ BAR_FORMAT = "  {desc}: {n}/{total} [{elapsed}]"
 
 # Dry-run stand-ins for paths and values a real run would create
 DRY_RUN_DIR = "/tmp/dry-run"
-DRY_RUN_WORK_DIR = "/tmp/snap-work.dry-run"  # a work directory on a host
+DRY_RUN_WORK_DIR = "/tmp/molt-work.dry-run"  # a work directory on a host
 DRY_RUN_CHECKSUM = "abcd123"
 
 # Display names for the dry-run stand-ins, most specific first
@@ -680,7 +682,7 @@ def rsync_copy(source, dest, desc, label=None):
 def run_scripts(root_dir, config, when, working_dir, phase=None):
     """Run a config's before or after scripts on this machine, in working_dir.
 
-    On a host, snap.py runs there and runs the scripts itself (--run-scripts is passed
+    On a host, molt.py runs there and runs the scripts itself (--run-scripts is passed
     to it), so they run as in a local restore or capture. phase is display only; it
     names the migration phase ('capture before scripts').
     """
@@ -743,15 +745,19 @@ def run_scripts(root_dir, config, when, working_dir, phase=None):
             fatal(f"Script {script_name} failed (exit status {e.returncode})")
 
 
-# --- Snap Configuration --- #
+# --- Molt Configuration --- #
 
-DEFAULT_ROOT_SNAP = "~/.snap"
+DEFAULT_ROOT = "~/.molt"
 
-# A host's snap root when no path is given, relative to its login directory
-DEFAULT_REMOTE_ROOT = ".snap"
+# The root from before molt was renamed from snap; used when only it exists
+LEGACY_ROOT = "~/.snap"
+
+# A host's molt root when no path is given, relative to its login directory
+DEFAULT_REMOTE_ROOT = ".molt"
 
 DEFAULT_CONFIG_CAPTURE = "configs/capture.toml"
 DEFAULT_CONFIG_DEPLOY = "configs/deploy.toml"
+DEFAULT_CONFIG_INSTALL = "configs/install.toml"
 DEFAULT_CONFIG_RESTORE = "configs/restore.toml"
 DEFAULT_CONFIG_MIGRATE = "configs/migrate.toml"
 
@@ -829,18 +835,18 @@ def normalize_remote_path(path):
     return PurePosixPath(*parts)
 
 
-def remote_snap_root(args, host):
-    """Return the snap root on a host: the -r path for the -r host, else .snap."""
+def remote_molt_root(args, host):
+    """Return the molt root on a host: the -r path for the -r host, else .molt."""
     if host and host == getattr(args, "root_host", None):
         return args.root_path
     return PurePosixPath(DEFAULT_REMOTE_ROOT)
 
 
-# A remote snap root (-r host:path) is read from a local copy of its configs/ and
+# A remote molt root (-r host:path) is read from a local copy of its configs/ and
 # scripts/; messages name that copy by the host:path it came from
 _root_names = {}
 
-# rsync filter rules that copy only a snap root's configs/ and scripts/ (captures/ and
+# rsync filter rules that copy only a molt root's configs/ and scripts/ (captures/ and
 # anything else stay on the host). Either may be missing
 ROOT_COPY_FILTER = [
     "--include=/configs/",
@@ -852,7 +858,7 @@ ROOT_COPY_FILTER = [
 
 
 def root_shown(path):
-    """Return a path for messages, naming a remote snap root's copy by its host:path."""
+    """Return a path for messages, naming a remote molt root's copy by its host:path."""
     text = str(path)
     for copy, name in _root_names.items():
         if text == copy or text.startswith(copy + os.sep):
@@ -861,7 +867,7 @@ def root_shown(path):
 
 
 def root_fetch(host, path, local_dir):
-    """Copy a remote snap root's configs/ and scripts/ into local_dir.
+    """Copy a remote molt root's configs/ and scripts/ into local_dir.
 
     This only reads the host, so a dry run copies too and can read the real configs.
     The caller creates and removes local_dir.
@@ -871,7 +877,7 @@ def root_fetch(host, path, local_dir):
         source,
         f"{local_dir}/",
         check=False,
-        desc=f"the snap root from {host}",
+        desc=f"the molt root from {host}",
         options=ROOT_COPY_FILTER,
         read_only=True,
     )
@@ -881,9 +887,12 @@ def root_fetch(host, path, local_dir):
         if str(path) == DEFAULT_REMOTE_ROOT:
             details.append(
                 f"Create a {DEFAULT_REMOTE_ROOT} directory on {host}, "
-                f"or pass -r/--snap-root {host}:<path>"
+                f"or pass -r/--molt-root {host}:<path> (an older install's is .snap)"
             )
-        fatal(f"Copying the snap root from {host} failed (rsync exit status {result[0]})", *details)
+        fatal(
+            f"Copying the molt root from {host} failed (rsync exit status {result[0]})",
+            *details,
+        )
     _root_names[str(local_dir)] = f"{host}:{path}"
 
 
@@ -899,38 +908,47 @@ def root_display(root):
 
 
 def resolve_root(specified_root):
-    """Resolve the local snap root directory (main() handles a remote one).
+    """Resolve the local molt root directory (main() handles a remote one).
 
     Search order:
     1. Use specified_root if provided (and it's not the default)
-    2. Check for .snap in current directory
-    3. Check for ~/.snap
-    4. Error if none exist
+    2. Check for .molt in current directory
+    3. Check for ~/.molt
+    4. Check for ~/.snap, the root from before the rename, with a warning
+    5. Error if none exist
     """
     # Resolve both paths for comparison
-    default_resolved = Path(DEFAULT_ROOT_SNAP).expanduser().resolve()
+    default_resolved = Path(DEFAULT_ROOT).expanduser().resolve()
     specified_resolved = Path(specified_root).expanduser().resolve()
 
     # If user specified a root explicitly (not the default), use it (don't validate)
     if specified_resolved != default_resolved:
         return specified_resolved
 
-    # Check PWD for .snap
-    pwd_root = Path.cwd() / ".snap"
+    # Check PWD for .molt
+    pwd_root = Path.cwd() / ".molt"
     if pwd_root.exists() and pwd_root.is_dir():
         return pwd_root.resolve()
 
-    # Check home directory for .snap
-    home_root = Path(DEFAULT_ROOT_SNAP).expanduser()
+    # Check home directory for .molt
+    home_root = Path(DEFAULT_ROOT).expanduser()
     if home_root.exists() and home_root.is_dir():
         return home_root.resolve()
 
+    legacy_root = Path(LEGACY_ROOT).expanduser()
+    if legacy_root.is_dir() and not home_root.exists():
+        warn(
+            f"Using {legacy_root}, the root from before snap was renamed molt",
+            f"Move it with: mv {legacy_root} {home_root}",
+        )
+        return legacy_root.resolve()
+
     # None found - error
     fatal(
-        "No .snap directory found",
+        "No .molt directory found",
         f"searched: {pwd_root}",
         f"searched: {home_root.resolve()}",
-        "Create a .snap directory, or pass -r/--snap-root <path>",
+        "Create a .molt directory, or pass -r/--molt-root <path>",
     )
 
 
@@ -942,7 +960,7 @@ def resolve_snapshot_root(captures_dir):
     if not captures_dir.exists():
         fatal(
             f"Captures directory not found: {captures_dir}",
-            "Run 'snap.py capture' first, or pass --from <snapshot>",
+            "Run 'molt.py capture' first, or pass --from <snapshot>",
         )
 
     # Try today first
@@ -968,7 +986,7 @@ def resolve_snapshot_root(captures_dir):
     if not latest:
         fatal(
             f"No snapshots found in {captures_dir}",
-            "Run 'snap.py capture' first, or pass --from <snapshot>",
+            "Run 'molt.py capture' first, or pass --from <snapshot>",
         )
 
     return latest
@@ -1126,6 +1144,16 @@ def verify_capture_config(config, config_name, table="tar"):
                 f"{config_name}: the 'encrypt' key in [{table}.{category}] must be "
                 "true or false"
             )
+
+    # [install] draft = true writes a draft install.toml into the snapshot
+    install_table = table[: -len("tar")] + "install"
+    install = config.get("install", {})
+    if (
+        not isinstance(install, dict)
+        or any(key != "draft" for key in install)
+        or not isinstance(install.get("draft", False), bool)
+    ):
+        fatal(f"{config_name}: [{install_table}] takes only 'draft = true' or 'draft = false'")
 
     verify_age_recipients(config, config_name, table)
 
@@ -1734,7 +1762,7 @@ def generate_snapshot_toml(
     # tomllib reads TOML as UTF-8, whatever the locale. The file is private (0600)
     fd = os.open(toml_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write("# Snapshot written by snap.py capture\n")
+        f.write("# Snapshot written by molt.py capture\n")
         f.write(toml_dumps(snapshot))
     os.chmod(toml_path, PRIVATE_FILE_MODE)
 
@@ -2558,17 +2586,17 @@ def remote_workdir(host, purpose, subdirs=()):
     remote_workdir_remove() in a finally block.
     """
     step(f"Creating work directory on {host}")
-    template = f"${{TMPDIR:-/tmp}}/snap-{purpose}.XXXXXXXX"
+    template = f"${{TMPDIR:-/tmp}}/molt-{purpose}.XXXXXXXX"
     _, stdout, _ = ssh_run(host, f'mktemp -d "{template}"', desc="Creating the work directory")
 
     if __dry_run__:
         work_dir = PurePosixPath(DRY_RUN_WORK_DIR)
     else:
         # The path is the last line (a login script may print before it). Anything but
-        # an absolute snap-<purpose>.* path is never used, so rm -rf only gets mktemp's
+        # an absolute molt-<purpose>.* path is never used, so rm -rf only gets mktemp's
         lines = stdout.strip().splitlines()
         work_dir = PurePosixPath(lines[-1].strip() if lines else "")
-        usable = work_dir.is_absolute() and work_dir.name.startswith(f"snap-{purpose}.")
+        usable = work_dir.is_absolute() and work_dir.name.startswith(f"molt-{purpose}.")
         if not usable or remote_path_problem(work_dir):
             fatal(
                 f"Cannot create a work directory on {host}: mktemp printed no usable path",
@@ -2588,16 +2616,16 @@ def remote_workdir(host, purpose, subdirs=()):
 
 
 def remote_stop_command(work_dir, command):
-    """Build a shell line that stops 'snap.py <command> -r <work_dir>' on a host.
+    """Build a shell line that stops 'molt.py <command> -r <work_dir>' on a host.
 
-    pkill -f matches the snap.py run and the shell that started it. The '[.]' keeps the
+    pkill -f matches the molt.py run and the shell that started it. The '[.]' keeps the
     pattern from matching the shell that runs this pkill. It sends SIGINT, like Ctrl-C,
-    so snap.py there removes its own staging dir (which holds plaintext archives) before
+    so molt.py there removes its own staging dir (which holds plaintext archives) before
     it exits. It waits a moment when it stopped something, and its exit status is never
     used.
     """
     escaped = re.sub(r"([.+])", r"\\\1", str(work_dir))
-    pattern = f"snap[.]py {command} -r {escaped}( |$)"
+    pattern = f"molt[.]py {command} -r {escaped}( |$)"
     return f"pkill -INT -f {shlex.quote(pattern)} && sleep 2"
 
 
@@ -2607,7 +2635,7 @@ def remote_workdir_remove(host, work_dir, report=True, running=None):
     After a run that went well (report=True) it prints its step, and a failed rm is a
     Warning. After a failure or Ctrl-C (report=False) it prints nothing, so the run still
     ends with its own Error block, and never raises for ssh problems. running names the
-    snap.py command that may still run in the work dir then ('capture'); it is stopped
+    molt.py command that may still run in the work dir then ('capture'); it is stopped
     first, so it can't recreate files there.
     """
     command = f"rm -rf {shlex.quote(str(work_dir))}"
@@ -2639,19 +2667,19 @@ def remote_workdir_remove(host, work_dir, report=True, running=None):
         pass  # Best effort; the run is already failing
 
 
-# --- Remote snap.py Runs --- #
+# --- Remote molt.py Runs --- #
 
-# snap.py's name in a host's work directory
-REMOTE_SCRIPT = "snap.py"
+# molt.py's name in a host's work directory
+REMOTE_SCRIPT = "molt.py"
 
 
 def remote_scripts(root_dir, config, host):
     """List the before and after scripts to copy to a host for --run-scripts.
 
-    Returns their paths relative to the snap root. Each is copied to the same path in the
-    work directory, so snap.py there (-r <work dir>) finds it where the config says.
-    Missing scripts are left out; snap.py on the host warns about them. A path outside the
-    snap root (absolute, or with '..') has no place in the work directory, so it stops
+    Returns their paths relative to the molt root. Each is copied to the same path in the
+    work directory, so molt.py there (-r <work dir>) finds it where the config says.
+    Missing scripts are left out; molt.py on the host warns about them. A path outside the
+    molt root (absolute, or with '..') has no place in the work directory, so it stops
     the run before the host is touched.
     """
     table = config.get("scripts") if isinstance(config, dict) else None
@@ -2669,8 +2697,8 @@ def remote_scripts(root_dir, config, host):
             path = PurePosixPath(entry)
             if path.is_absolute() or ".." in path.parts:
                 fatal(
-                    f"Cannot copy script {entry} to {host}: it is outside the snap root",
-                    f"Move it into the snap root (for example scripts/{path.name}) "
+                    f"Cannot copy script {entry} to {host}: it is outside the molt root",
+                    f"Move it into the molt root (for example scripts/{path.name}) "
                     "and list that path",
                 )
             if path not in scripts and (root_dir / path).is_file():
@@ -2689,10 +2717,10 @@ def remote_layout(base, scripts):
 
 
 def remote_copies(root_dir, host, work_dir, config_src, config_name, scripts):
-    """List the copies (source, dest, desc) that give a work directory what snap.py needs.
+    """List the copies (source, dest, desc) that give a work directory what molt.py needs.
 
-    That is snap.py, the config (config_src, copied to config_name) and the scripts at
-    their paths relative to the snap root.
+    That is molt.py, the config (config_src, copied to config_name) and the scripts at
+    their paths relative to the molt root.
     """
     dest = f"{host}:{work_dir}"
     transfers = [
@@ -2705,7 +2733,7 @@ def remote_copies(root_dir, host, work_dir, config_src, config_name, scripts):
 
 
 def remote_child(work_dir, command, *options, private=False):
-    """Build the shell line that runs 'snap.py <command> [options]' in a host's work dir.
+    """Build the shell line that runs 'molt.py <command> [options]' in a host's work dir.
 
     python3 comes from the host's PATH (this machine's interpreter path means nothing
     there). --verbose passes through; the caller passes the command's other flags.
@@ -2722,25 +2750,25 @@ def remote_child(work_dir, command, *options, private=False):
 
 
 def restore_child_config(restore_config, table="tar"):
-    """Return what restore() reads from a restore config, for a snap.py run with -t.
+    """Return what restore() reads from a restore config, for a molt.py run with -t.
 
     That is the [tar] 'archives' key (a missing or empty one becomes [], which skips the
     archive restore just the same), the before and after [scripts], and the [age]
     identity's path. table is the name the user's config gives the [tar] table
-    ('restore.tar' in migrate.toml); it goes in [snap] so the other run's messages name
-    it the same way. A missing 'archives' key is noted in [snap] too, so the other run
+    ('restore.tar' in migrate.toml); it goes in [molt] so the other run's messages name
+    it the same way. A missing 'archives' key is noted in [molt] too, so the other run
     reports it as a local run does.
     """
     tar_table = restore_config.get("tar", {})
     archives = tar_table.get("archives") or []
     child_config = {"tar": {"archives": archives}}
-    snap_table = {}
+    molt_table = {}
     if table != "tar":
-        snap_table["table"] = table
+        molt_table["table"] = table
     if "archives" not in tar_table:
-        snap_table["no_archives_key"] = True
-    if snap_table:
-        child_config["snap"] = snap_table
+        molt_table["no_archives_key"] = True
+    if molt_table:
+        child_config["molt"] = molt_table
     if "scripts" in restore_config:
         scripts = restore_config["scripts"]
         child_config["scripts"] = {
@@ -2905,6 +2933,10 @@ def capture(args, root_dir, outdir, config, config_name=DEFAULT_CONFIG_CAPTURE, 
         # Move snapshot TOML to checksum directory
         toml_path.rename(dst_dir / DEFAULT_SNAPSHOT_TOML)
 
+    # A draft of what is installed goes with the snapshot, ahead of the after scripts
+    if config.get("install", {}).get("draft") is True:
+        install_draft_write(dst_dir / DRAFT_INSTALL_TOML)
+
     # Run after-capture scripts from the same config as the archives and before scripts
     if args.run_scripts:
         run_scripts(root_dir, config, "after", working_dir=dst_dir, phase=phase)
@@ -2964,11 +2996,11 @@ def remote_snapshot_id(stdout, out_dir, host):
 
 
 def remote_capture(args, root_dir, source_host, capture_config=None):
-    """Run snap.py capture on a host, then copy the snapshot it saved into a local temp dir.
+    """Run molt.py capture on a host, then copy the snapshot it saved into a local temp dir.
 
     Without capture_config the host gets the capture config from -t or the default in
     root_dir; migrate passes its [capture.*] half, which is written to a temp TOML. With
-    --run-scripts the host also gets the config's scripts, and snap.py there runs them.
+    --run-scripts the host also gets the config's scripts, and molt.py there runs them.
     Returns (the snapshot copy, named after the host's snapshot id; the temp dir to
     remove, or None in a dry run). The work directory on the host is removed however the
     capture ends.
@@ -3010,7 +3042,7 @@ def remote_capture(args, root_dir, source_host, capture_config=None):
                 f"{plural(len(transfers), 'file')}"
             )
 
-        # snap.py on the host saves the snapshot in out/, and runs the scripts itself.
+        # molt.py on the host saves the snapshot in out/, and runs the scripts itself.
         # It takes as long as the archives do: no wall-clock limit
         out_dir = work_dir / "out"
         options = ["-r", work_dir, "-t", DEFAULT_CONFIG_CAPTURE, "--to", out_dir]
@@ -3062,7 +3094,7 @@ def remote_capture(args, root_dir, source_host, capture_config=None):
             f"the snapshot from {source_host}",
             label="snapshot",
         )
-        # snap.py on the host made it private and rsync -a kept the modes; make sure
+        # molt.py on the host made it private and rsync -a kept the modes; make sure
         if not __dry_run__ and snapshot.is_dir():
             snapshot_private(snapshot)
         done = True
@@ -3227,7 +3259,7 @@ def sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config, t
 
     The child restores from the local capture_dir with the same restore config, so
     remote pulls and captures aren't repeated as root and the caller's temp dirs
-    still get cleaned up. Its snap root is the local root_dir (for a remote snap root,
+    still get cleaned up. Its molt root is the local root_dir (for a remote molt root,
     the local copy), so it never reads a host as root. sudo resets the environment, so
     HOME and the variables used by roots and links are passed through, or '$HOME' and
     '~' would expand to root's home.
@@ -3422,9 +3454,9 @@ def restore_snapshot(
         config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_RESTORE
         restore_config = load_config(root_dir, config_name)
         verify_restore_config(restore_config, config_name)
-        # A config written for this run by another snap.py names the user's table, and
+        # A config written for this run by another molt.py names the user's table, and
         # says when the user's config had no 'archives' key
-        table = restore_config.get("snap", {}).get("table", table)
+        table = restore_config.get("molt", {}).get("table", table)
 
     # Get archives from config
     # Semantics: None/[] = skip restore, ["*"] = restore all, [patterns...] = restore matching
@@ -3489,7 +3521,7 @@ def restore_snapshot(
 
     # Restore archives; done and failed collect the archives restored and failed
     done, failed = [], []
-    no_archives_key = restore_config.get("snap", {}).get("no_archives_key", False)
+    no_archives_key = restore_config.get("molt", {}).get("no_archives_key", False)
     if archives is None:
         if "archives" in tar_table and not no_archives_key:
             step_skipped("archive restore", f"[{table}] archives is empty")
@@ -3615,12 +3647,12 @@ def remote_relay(args, root_dir, source_host, dest_host):
 
 
 def remote_deploy(args, root_dir, dest_host, local_capture, deploy_config=None, label=None):
-    """Copy a local snapshot to a host and restore it there with snap.py.
+    """Copy a local snapshot to a host and restore it there with molt.py.
 
-    snap.py on the host restores its copy as a local restore does: it re-runs itself with
+    molt.py on the host restores its copy as a local restore does: it re-runs itself with
     sudo only when the restore needs root, and with --run-scripts it runs the config's
     scripts. Without deploy_config the restore config comes from -t or the default in
-    root_dir (a remote snap root's local copy included); migrate passes its [restore.*]
+    root_dir (a remote molt root's local copy included); migrate passes its [restore.*]
     half, written to a temp TOML. label names the snapshot in error lines. The work
     directory on dest_host is removed however the restore ends.
     """
@@ -3670,7 +3702,7 @@ def remote_deploy(args, root_dir, dest_host, local_capture, deploy_config=None, 
         work_dir = remote_workdir(dest_host, "restore", layout)
 
         # The whole snapshot directory, with any files after-capture scripts wrote into
-        # it, then snap.py, the config and the scripts; all in parallel
+        # it, then molt.py, the config and the scripts; all in parallel
         transfers = remote_copies(
             root_dir, dest_host, work_dir, config_src, DEFAULT_CONFIG_RESTORE, scripts
         )
@@ -3682,7 +3714,7 @@ def remote_deploy(args, root_dir, dest_host, local_capture, deploy_config=None, 
             failed = len(transfers) - success_count
             fatal(f"Copying to {dest_host} failed for {failed} of {len(transfers)} copies")
 
-        # snap.py on the host decides whether it needs sudo, and asks for a password (or,
+        # molt.py on the host decides whether it needs sudo, and asks for a password (or,
         # with --disable-rollback, for each archive) on the terminal. It takes as long as
         # the archives do: no wall-clock limit
         options = ["--from", work_dir / "snapshot", "-r", work_dir, "-t", DEFAULT_CONFIG_RESTORE]
@@ -3699,7 +3731,7 @@ def remote_deploy(args, root_dir, dest_host, local_capture, deploy_config=None, 
             desc="Restore",
             timeout=None,
         )
-        # With ssh -t, Ctrl-C reaches snap.py on the host, which rolls back and exits
+        # With ssh -t, Ctrl-C reaches molt.py on the host, which rolls back and exits
         # 130 (or dies from SIGINT); report and exit like an interrupted local restore
         if code == 130 or code == -signal.SIGINT:
             error(f"Restore on {dest_host} was interrupted")
@@ -3734,7 +3766,7 @@ def split_migrate_config(config, config_name):
         fatal(f"{config_name}: missing required [capture.tar] table")
 
     capture_config = {"tarball": tarball, "tar": capture_section.get("tar", {})}
-    for key in ("scripts", "age"):
+    for key in ("scripts", "age", "install"):
         if key in capture_section:
             capture_config[key] = capture_section[key]
 
@@ -3814,7 +3846,7 @@ def backup_dirs_find(snapshots):
                 continue
             root_path = expand_path(root)
             if not root_path.is_absolute() or root_path == Path(root_path.anchor):
-                continue  # An unset variable, or '/': no backup dir snap.py would use
+                continue  # An unset variable, or '/': no backup dir molt.py would use
             base = backup_dir(root_path, roll_ext)
             bases.setdefault(os.path.realpath(base), base)
 
@@ -4046,6 +4078,1162 @@ def prune_delete(captures_dir, snapshots, backups):
     return deleted_snapshots, deleted_backups
 
 
+# --- Install Logic --- #
+
+# The sections of install.toml, in the order they install unless [install] order sets
+# another. Homebrew goes first, since it installs most other tools; custom goes before
+# the language tools, so its commands can install their managers (rustup, uv); manual
+# goes last, as the list of what is left to install by hand
+INSTALL_SECTIONS = ["brew", "mas", "custom", "mise", "npm", "cargo", "uv", "vscode", "manual"]
+
+# Where package managers put their commands on a new machine, before a shell has put them
+# on PATH. Install commands get the ones that exist after PATH's own entries, so a tool
+# that one section installs is found by the next
+INSTALL_PATH_DIRS = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "~/.cargo/bin",
+    "~/.local/bin",
+    "/Applications/Visual Studio Code.app/Contents/Resources/app/bin",
+]
+
+# Homebrew installs what is missing and never upgrades what is already installed
+INSTALL_BREW_ENV = {
+    "HOMEBREW_NO_INSTALL_UPGRADE": "1",
+    "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK": "1",
+}
+
+# Where apps are looked for: a [[manual]] 'app', App Store apps, and the apps a draft lists
+INSTALL_APP_DIRS = ["/Applications", "~/Applications"]
+
+# Taps every Homebrew has, and global npm packages that come with node; drafts skip them
+BREW_DEFAULT_TAPS = {"homebrew/core", "homebrew/cask"}
+NPM_BUNDLED = {"npm", "corepack"}
+
+# The file a draft is written to in a snapshot, with 'draft = true' in capture.toml
+DRAFT_INSTALL_TOML = "install.toml"
+
+
+class InstallItem:
+    """One thing a section installs: key matches what is installed, label names it."""
+
+    def __init__(self, key, label, value=None):
+        self.key = key
+        self.label = label
+        self.value = key if value is None else value
+
+
+class InstallState:
+    """What is installed of a group: the installed keys, and labels of what isn't in the config."""
+
+    def __init__(self, installed, extra=()):
+        self.installed = set(installed)
+        self.extra = list(extra)
+
+
+def install_env():
+    """Return the environment install commands run in: PATH gains INSTALL_PATH_DIRS."""
+    paths = [path for path in os.environ.get("PATH", "").split(os.pathsep) if path]
+    for entry in INSTALL_PATH_DIRS:
+        path = str(Path(entry).expanduser())
+        if path not in paths and os.path.isdir(path):
+            paths.append(path)
+    return dict(os.environ, PATH=os.pathsep.join(paths), **INSTALL_BREW_ENV)
+
+
+def install_which(tool):
+    """Find a command on the install PATH; return its path or None."""
+    return shutil.which(tool, path=install_env()["PATH"])
+
+
+def install_query(argv, what, any_status=False):
+    """Run a read-only command and return its stdout, or None after an Error line.
+
+    Queries change nothing, so they run in a dry run too. what names the query in the
+    Error line ('list the Homebrew casks'). any_status accepts any exit status, for
+    tools that exit 1 with a usable answer (npm ls with extraneous packages).
+    """
+    echo(argv, 1, verbose=True, runs=True)
+    try:
+        result = subprocess.run(
+            argv,
+            env=install_env(),
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=COMMAND_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        error(f"Cannot {what}: {argv[0]} timed out after {COMMAND_TIMEOUT}s")
+        return None
+    except OSError as e:
+        error(f"Cannot {what}: {e.strerror or e}")
+        return None
+    if result.returncode != 0 and not any_status:
+        relay(result.stderr, 1, sys.stderr)
+        error(f"Cannot {what} ({Path(argv[0]).name} exit status {result.returncode})")
+        return None
+    return result.stdout
+
+
+def install_lines(text):
+    """Split command output into its non-empty, stripped lines."""
+    return [line.strip() for line in (text or "").splitlines() if line.strip()]
+
+
+def install_check(command):
+    """Run a check command with bash: exit status 0 means installed. It runs in a dry run too."""
+    argv = ["bash", "-c", command]
+    echo(argv, 1, verbose=True, runs=True)
+    try:
+        result = subprocess.run(
+            argv,
+            env=install_env(),
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=COMMAND_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        warn(f"Check '{command}' timed out after {COMMAND_TIMEOUT}s; counting it as missing")
+        return False
+    except OSError as e:
+        warn(f"Cannot run check '{command}': {e.strerror or e}; counting it as missing")
+        return False
+    return result.returncode == 0
+
+
+def install_run(argv):
+    """Run one install command on the terminal; return its exit status.
+
+    Installers ask for things (a sudo password for a cask's pkg, an App Store sign-in, a
+    'curl | sh' installer's questions), so the command keeps the terminal, as the sudo
+    re-run does. Without a terminal its stdin is /dev/null, so a prompt fails instead of
+    waiting. A dry run only shows the command.
+    """
+    echo(argv, 1, verbose=True)
+    if __dry_run__:
+        return 0
+    try:
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        interactive = False
+    flush_stream(sys.stdout)
+    flush_stream(sys.stderr)
+    try:
+        result = subprocess.run(
+            argv, env=install_env(), stdin=None if interactive else subprocess.DEVNULL
+        )
+    except OSError as e:
+        error(f"Cannot run {argv[0]}: {e.strerror or e}")
+        return 127
+    return result.returncode
+
+
+def install_names(table, key, where, config_name):
+    """Return the array of names at table[key] (default empty), or stop on a bad one."""
+    value = table.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        fatal(f"{config_name}: the '{key}' key in {where} must be an array of names")
+    return value
+
+
+def install_keys(table, keys, where, config_name):
+    """Stop on a key the table doesn't take, so a typo isn't silently ignored."""
+    unknown = [key for key in table if key not in keys]
+    if unknown:
+        fatal(
+            f"{config_name}: unknown key '{unknown[0]}' in {where}",
+            f"{where} takes: {', '.join(keys)}",
+        )
+
+
+def folder_app(folder):
+    """Pick the main app of a folder of apps (KiCad/KiCad.app), or None if it has none.
+
+    That is the shortest name that starts with the folder's name, else the shortest
+    name; uninstallers are never picked.
+    """
+    try:
+        apps = [p for p in folder.iterdir() if p.suffix == ".app"]
+    except OSError:
+        return None
+    apps = [app for app in apps if not app.name.startswith("Uninstall")]
+    if not apps:
+        return None
+    named = [app for app in apps if app.name.lower().startswith(folder.name.lower())]
+    return min(named or apps, key=lambda app: (len(app.name), app.name))
+
+
+def app_bundles():
+    """List the .app bundles in INSTALL_APP_DIRS, and the main app of each folder there."""
+    apps = []
+    for entry in INSTALL_APP_DIRS:
+        base = Path(entry).expanduser()
+        try:
+            children = sorted(base.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.suffix == ".app":
+                apps.append(child)
+            elif child.is_dir() and not child.is_symlink():
+                app = folder_app(child)
+                if app:
+                    apps.append(app)
+    return apps
+
+
+def app_find(app):
+    """Check if an app is installed: a path, or a name looked for in INSTALL_APP_DIRS."""
+    if not app.endswith(".app"):
+        app += ".app"
+    if app.startswith(("/", "~")):
+        return expand_path(app).exists()
+    return any((Path(entry).expanduser() / app).exists() for entry in INSTALL_APP_DIRS)
+
+
+def app_store_ids(apps):
+    """Map each app bundle with an App Store id to that id, from Spotlight's metadata."""
+    if not apps or not shutil.which("mdls"):
+        return {}
+    argv = ["mdls", "-raw", "-nullMarker", "", "-name", "kMDItemAppStoreAdamID"]
+    out = install_query(argv + [str(app) for app in apps], "read the App Store ids")
+    if out is None:
+        return {}
+    ids = {}
+    # mdls ends each value with NUL, so the split has one more part than there are apps
+    for app, value in zip(apps, out.split("\0"), strict=False):
+        if value.strip().isdigit():
+            ids[app] = int(value.strip())
+    return ids
+
+
+def app_bundle_id(app):
+    """Read an app's bundle id from its Info.plist, or '' if it can't be read."""
+    try:
+        with open(app / "Contents" / "Info.plist", "rb") as f:
+            return str(plistlib.load(f).get("CFBundleIdentifier", ""))
+    except Exception:
+        # A broken Info.plist raises whatever its parser does (ExpatError, ValueError);
+        # the app then just isn't known to be Apple's
+        return ""
+
+
+def ruby_string(value):
+    """Format a string for a Brewfile (Ruby): a TOML basic string, with '#' escaped."""
+    return toml_string(value).replace("#", "\\#")
+
+
+def brew_short(name):
+    """Name a formula or cask as 'brew list' does: without its tap, in lowercase."""
+    return name.rsplit("/", 1)[-1].lower()
+
+
+def brew_bundle(lines):
+    """Install a Brewfile of lines with 'brew bundle install'; return failure details."""
+    if __verbose__:
+        say(labeled("Brewfile:", "\n".join(lines)))
+    if __dry_run__:
+        install_run(["brew", "bundle", "install", "--no-upgrade", f"--file={DRY_RUN_DIR}/Brewfile"])
+        return []
+    fd, path = tempfile.mkstemp(prefix=f"{__script__.stem}-", suffix=".Brewfile")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        code = install_run(["brew", "bundle", "install", "--no-upgrade", f"--file={path}"])
+    finally:
+        os.unlink(path)
+    return [] if code == 0 else [f"brew bundle exit status {code}"]
+
+
+def install_commands(argvs):
+    """Run install commands in order; return a failure detail for each one that failed."""
+    failures = []
+    for argv in argvs:
+        code = install_run(argv)
+        if code != 0:
+            failures.append(f"{shlex.join(argv)}: exit status {code}")
+    return failures
+
+
+class InstallGroup:
+    """A unit of install.toml that installs together: a built-in section, or one [[custom]].
+
+    A subclass lists its items, reports what is installed, and installs the rest. A new
+    package manager is a subclass with a section name in INSTALL_SECTIONS and an entry
+    in INSTALL_GROUPS; draft() lets 'install --draft' fill its section in.
+    """
+
+    section = ""
+    tool = None
+    keys = ()
+
+    def __init__(self, table, config_name):
+        self.table = table
+        self.config_name = config_name
+        self.title = self.section
+        install_keys(table, self.keys, f"[{self.section}]", config_name)
+
+    def unavailable(self):
+        """Return why this group can't run here (its tool is missing), or None."""
+        if self.tool and not install_which(self.tool):
+            return f"{self.tool} not found"
+        return None
+
+    def items(self):
+        """Return the InstallItems the config lists."""
+        return []
+
+    def present(self):
+        """Return an InstallState, or None after an Error line."""
+        return InstallState(())
+
+    def install(self, missing):
+        """Install the missing items; return failure details for the Error line."""
+        return []
+
+    @staticmethod
+    def draft():
+        """Return this section's table for a draft of what is installed, or None."""
+        return None
+
+
+class NamesGroup(InstallGroup):
+    """A section that is one array of names, listed by one command and installed by another."""
+
+    names_key = ""
+    case_blind = False
+
+    def key(self, name):
+        return name.lower() if self.case_blind else name
+
+    def items(self):
+        names = install_names(self.table, self.names_key, f"[{self.section}]", self.config_name)
+        return [InstallItem(self.key(name), f"'{name}'", name) for name in names]
+
+    def listed(self):
+        """Return the names installed on this machine, or None after an Error line."""
+        return []
+
+    def present(self):
+        names = self.listed()
+        if names is None:
+            return None
+        wanted = {item.key for item in self.items()}
+        installed = {self.key(name) for name in names}
+        extra = [f"'{name}'" for name in names if self.key(name) not in wanted]
+        return InstallState(installed, extra)
+
+
+class BrewGroup(InstallGroup):
+    """[brew]: taps, formulae and casks, installed with 'brew bundle'."""
+
+    section = "brew"
+    tool = "brew"
+    keys = ("taps", "formulae", "casks")
+
+    # Config key, label, Brewfile keyword
+    KINDS = [("taps", "tap", "tap"), ("formulae", "formula", "brew"), ("casks", "cask", "cask")]
+
+    def items(self):
+        items = []
+        for key, kind, keyword in self.KINDS:
+            for name in install_names(self.table, key, "[brew]", self.config_name):
+                ident = name.lower() if kind == "tap" else brew_short(name)
+                line = f"{keyword} {ruby_string(name)}"
+                items.append(InstallItem(f"{kind}:{ident}", f"{kind} '{name}'", line))
+        return items
+
+    @staticmethod
+    def query():
+        """Return the taps, formulae, casks and leaves, or None after an Error line."""
+        queries = [
+            (["brew", "tap"], "list the Homebrew taps"),
+            (["brew", "list", "--formula", "-1"], "list the Homebrew formulae"),
+            (["brew", "list", "--cask", "-1"], "list the Homebrew casks"),
+            (["brew", "leaves", "--installed-on-request"], "list the Homebrew leaves"),
+        ]
+        outputs = [install_query(argv, what) for argv, what in queries]
+        if any(out is None for out in outputs):
+            return None
+        return [install_lines(out) for out in outputs]
+
+    def present(self):
+        found = self.query()
+        if found is None:
+            return None
+        taps, formulae, casks, leaves = found
+        installed = {f"tap:{tap.lower()}" for tap in taps}
+        installed |= {f"formula:{brew_short(name)}" for name in formulae}
+        installed |= {f"cask:{brew_short(name)}" for name in casks}
+
+        # Not in the config: taps of its own, formulae installed on request, and casks
+        wanted = {item.key for item in self.items()}
+        extra = [f"tap '{tap}'" for tap in taps
+                 if tap.lower() not in BREW_DEFAULT_TAPS and f"tap:{tap.lower()}" not in wanted]
+        extra += [f"formula '{name}'" for name in leaves
+                  if f"formula:{brew_short(name)}" not in wanted]
+        extra += [f"cask '{name}'" for name in casks if f"cask:{brew_short(name)}" not in wanted]
+        return InstallState(installed, extra)
+
+    def install(self, missing):
+        return brew_bundle([item.value for item in missing])
+
+    @staticmethod
+    def draft():
+        found = BrewGroup.query() if install_which("brew") else None
+        if found is None:
+            return None
+        taps, _, casks, leaves = found
+        return {
+            "taps": [tap for tap in taps if tap.lower() not in BREW_DEFAULT_TAPS],
+            "formulae": leaves,
+            "casks": casks,
+        }
+
+
+class MasGroup(InstallGroup):
+    """[mas]: Mac App Store apps by name and id, installed with mas through 'brew bundle'.
+
+    What is installed comes from Spotlight's App Store ids, so it needs neither mas nor
+    an App Store sign-in; an app the index hasn't seen yet counts when its name is in an
+    app folder.
+    """
+
+    section = "mas"
+    tool = "brew"
+    keys = ("apps",)
+
+    def items(self):
+        apps = self.table.get("apps", {})
+        if not isinstance(apps, dict) or not all(
+            isinstance(app_id, int) and not isinstance(app_id, bool) and app_id > 0
+            for app_id in apps.values()
+        ):
+            fatal(
+                f"{self.config_name}: [mas.apps] must map app names to App Store ids",
+                'For example: Xcode = 497799835',
+            )
+        return [
+            InstallItem(f"mas:{app_id}", f"app '{name}'", (name, app_id))
+            for name, app_id in apps.items()
+        ]
+
+    def present(self):
+        apps = app_bundles()
+        ids = app_store_ids(apps)
+        installed = {f"mas:{app_id}" for app_id in ids.values()}
+        installed |= {item.key for item in self.items() if app_find(item.value[0])}
+        wanted = {item.key for item in self.items()}
+        extra = [f"app '{app.stem}'" for app, app_id in ids.items()
+                 if f"mas:{app_id}" not in wanted]
+        return InstallState(installed, extra)
+
+    def install(self, missing):
+        lines = [] if install_which("mas") else ['brew "mas"']
+        lines += [f"mas {ruby_string(name)}, id: {app_id}" for name, app_id in
+                  (item.value for item in missing)]
+        return brew_bundle(lines)
+
+    @staticmethod
+    def draft():
+        ids = app_store_ids(app_bundles())
+        if not ids:
+            return None
+        return {"apps": {app.stem: app_id for app, app_id in sorted(ids.items())}}
+
+
+def mise_satisfied(versions, requested):
+    """Check if installed versions satisfy a requested one: '3.12' or '3.12.1' by prefix.
+
+    An alias ('latest', 'lts') is satisfied by any installed version, since which
+    version it names changes over time.
+    """
+    if not requested[:1].isdigit():
+        return bool(versions)
+    return any(v == requested or v.startswith(requested + ".") for v in versions)
+
+
+class MiseGroup(InstallGroup):
+    """[mise]: runtimes by tool and version. global = true (the default) also makes them the
+    global versions ('mise use --global'); false only installs them ('mise install')."""
+
+    section = "mise"
+    tool = "mise"
+    keys = ("global", "tools")
+
+    def tools(self):
+        tools = self.table.get("tools", {})
+        if not isinstance(tools, dict):
+            fatal(f"{self.config_name}: [mise.tools] must map tools to versions")
+        result = {}
+        for name, versions in tools.items():
+            if isinstance(versions, str):
+                versions = [versions]
+            if not isinstance(versions, list) or not versions or not all(
+                isinstance(v, str) and v for v in versions
+            ):
+                fatal(
+                    f"{self.config_name}: '{name}' in [mise.tools] must be a version or an "
+                    "array of versions"
+                )
+            result[name] = versions
+        if not isinstance(self.table.get("global", True), bool):
+            fatal(f"{self.config_name}: the 'global' key in [mise] must be true or false")
+        return result
+
+    def items(self):
+        return [
+            InstallItem(f"{name}@{version}", f"{name}@{version}", (name, version))
+            for name, versions in self.tools().items()
+            for version in versions
+        ]
+
+    def present(self):
+        out = install_query(["mise", "ls", "--installed", "--json"], "list the mise tools")
+        if out is None:
+            return None
+        try:
+            found = json.loads(out or "{}")
+            installed = {
+                name: [entry["version"] for entry in entries if "version" in entry]
+                for name, entries in found.items()
+            }
+        except (ValueError, TypeError, AttributeError) as e:
+            error(f"Cannot read the mise tools: {e}")
+            return None
+        keys = {
+            item.key for item in self.items()
+            if mise_satisfied(installed.get(item.value[0], []), item.value[1])
+        }
+        tools = self.tools()
+        extra = [f"tool '{name}'" for name in installed if name not in tools]
+        return InstallState(keys, extra)
+
+    def install(self, missing):
+        tools = self.tools()
+        if self.table.get("global", True):
+            # 'mise use' sets a tool's whole version list, so every version of a tool goes
+            # in, the first one as the default
+            names = list(dict.fromkeys(item.value[0] for item in missing))
+            specs = [f"{name}@{version}" for name in names for version in tools[name]]
+            return install_commands([["mise", "use", "--global", *specs]])
+        return install_commands([["mise", "install", *(item.label for item in missing)]])
+
+    @staticmethod
+    def draft():
+        config = os.environ.get("MISE_GLOBAL_CONFIG_FILE", "~/.config/mise/config.toml")
+        try:
+            with open(Path(config).expanduser(), "rb") as f:
+                tools = tomllib.load(f).get("tools", {})
+        except (OSError, tomllib.TOMLDecodeError):
+            return None
+        kept = {}
+        for name, value in tools.items():
+            if isinstance(value, str) or (
+                isinstance(value, list) and value and all(isinstance(v, str) for v in value)
+            ):
+                kept[name] = value
+        return {"global": True, "tools": kept} if kept else None
+
+
+def npm_name(spec):
+    """Strip a version from an npm package spec: 'pkg@1' -> 'pkg', '@s/pkg@1' -> '@s/pkg'."""
+    scoped = spec.startswith("@")
+    name = spec[1:] if scoped else spec
+    name = name.split("@", 1)[0]
+    return "@" + name if scoped else name
+
+
+class NpmGroup(NamesGroup):
+    """[npm]: global npm packages. Without npm on PATH, npm runs through 'mise exec'."""
+
+    section = "npm"
+    keys = ("packages",)
+    names_key = "packages"
+
+    @staticmethod
+    def command():
+        if install_which("npm"):
+            return ["npm"]
+        if install_which("mise"):
+            return ["mise", "exec", "--", "npm"]
+        return None
+
+    def unavailable(self):
+        return None if self.command() else "npm not found (install node, e.g. in [mise])"
+
+    def key(self, name):
+        return npm_name(name)
+
+    @staticmethod
+    def query():
+        command = NpmGroup.command()
+        if not command:
+            return None
+        argv = command + ["ls", "--global", "--depth=0", "--json"]
+        out = install_query(argv, "list the global npm packages", any_status=True)
+        if out is None:
+            return None
+        try:
+            return list(json.loads(out or "{}").get("dependencies", {}))
+        except (ValueError, AttributeError) as e:
+            error(f"Cannot read the global npm packages: {e}")
+            return None
+
+    def listed(self):
+        names = self.query()
+        return None if names is None else [n for n in names if n not in NPM_BUNDLED]
+
+    def install(self, missing):
+        return install_commands([self.command() + ["install", "--global", *(
+            item.value for item in missing)]])
+
+    @staticmethod
+    def draft():
+        names = NpmGroup.query()
+        names = [name for name in names or [] if name not in NPM_BUNDLED]
+        return {"packages": names} if names else None
+
+
+class CargoGroup(NamesGroup):
+    """[cargo]: crates installed with 'cargo install'."""
+
+    section = "cargo"
+    tool = "cargo"
+    keys = ("crates",)
+    names_key = "crates"
+
+    @staticmethod
+    def query():
+        out = install_query(["cargo", "install", "--list"], "list the cargo crates")
+        return None if out is None else re.findall(r"^(\S+) v\S*:", out, re.M)
+
+    def listed(self):
+        return self.query()
+
+    def install(self, missing):
+        return install_commands([["cargo", "install", *(item.value for item in missing)]])
+
+    @staticmethod
+    def draft():
+        crates = CargoGroup.query() if install_which("cargo") else None
+        return {"crates": crates} if crates else None
+
+
+class UvGroup(NamesGroup):
+    """[uv]: Python tools installed with 'uv tool install'."""
+
+    section = "uv"
+    tool = "uv"
+    keys = ("tools",)
+    names_key = "tools"
+
+    @staticmethod
+    def query():
+        out = install_query(["uv", "tool", "list"], "list the uv tools")
+        return None if out is None else re.findall(r"^([^\s-]\S*) v\S+", out, re.M)
+
+    def listed(self):
+        return self.query()
+
+    def install(self, missing):
+        return install_commands([["uv", "tool", "install", item.value] for item in missing])
+
+    @staticmethod
+    def draft():
+        tools = UvGroup.query() if install_which("uv") else None
+        return {"tools": tools} if tools else None
+
+
+class VscodeGroup(NamesGroup):
+    """[vscode]: Visual Studio Code extensions, by id."""
+
+    section = "vscode"
+    tool = "code"
+    keys = ("extensions",)
+    names_key = "extensions"
+    case_blind = True
+
+    @staticmethod
+    def query():
+        out = install_query(["code", "--list-extensions"], "list the VS Code extensions")
+        return None if out is None else install_lines(out)
+
+    def listed(self):
+        return self.query()
+
+    def install(self, missing):
+        argv = ["code"]
+        for item in missing:
+            argv += ["--install-extension", item.value]
+        return install_commands([argv])
+
+    @staticmethod
+    def draft():
+        extensions = VscodeGroup.query() if install_which("code") else None
+        return {"extensions": extensions} if extensions else None
+
+
+def item_command(command, item):
+    """Put an item, shell-quoted, in place of each {item} in a command."""
+    return command.replace("{item}", shlex.quote(item))
+
+
+class CustomGroup(InstallGroup):
+    """One [[custom]] entry: shell commands that check for and install a thing, or each of
+    its items ({item} in a command is the item, shell-quoted)."""
+
+    section = "custom"
+    keys = ("name", "install", "check", "list", "items", "requires")
+
+    def __init__(self, table, config_name):
+        if not isinstance(table, dict):
+            fatal(f"{config_name}: each [[custom]] entry must be a table")
+        name = table.get("name")
+        if not isinstance(name, str) or not name.strip():
+            fatal(f"{config_name}: a [[custom]] entry is missing its 'name'")
+        self.name = name
+        where = f"[[custom]] '{name}'"
+        install_keys(table, self.keys, where, config_name)
+        for key in ("install", "check", "list", "requires"):
+            value = table.get(key)
+            if value is not None and not (isinstance(value, str) and value.strip()):
+                fatal(f"{config_name}: the '{key}' key in {where} must be a command")
+        if not table.get("install"):
+            fatal(f"{config_name}: {where} needs an 'install' command")
+        if "items" in table:
+            install_names(table, "items", where, config_name)
+            if not table.get("check") and not table.get("list"):
+                fatal(f"{config_name}: {where} has 'items', so it needs a 'check' or 'list'")
+        elif table.get("list"):
+            fatal(f"{config_name}: {where} has a 'list' command but no 'items'")
+        elif not table.get("check"):
+            fatal(f"{config_name}: {where} needs a 'check' command")
+        super().__init__({}, config_name)
+        self.table = table
+        self.title = name
+
+    def unavailable(self):
+        requires = self.table.get("requires")
+        if requires and not install_which(requires):
+            return f"{requires} not found"
+        return None
+
+    def items(self):
+        if "items" not in self.table:
+            return [InstallItem(self.name, f"'{self.name}'", None)]
+        return [InstallItem(item, f"{self.name} '{item}'", item) for item in self.table["items"]]
+
+    def present(self):
+        items = self.items()
+        if self.table.get("list"):
+            out = install_query(["bash", "-c", self.table["list"]], f"list '{self.name}'")
+            if out is None:
+                return None
+            names = install_lines(out)
+            wanted = {item.key for item in items}
+            extra = [f"{self.name} '{name}'" for name in names if name not in wanted]
+            return InstallState(names, extra)
+        check = self.table["check"]
+        if "items" not in self.table:
+            return InstallState([self.name] if install_check(check) else [])
+        return InstallState(
+            item.key for item in items if install_check(item_command(check, item.value))
+        )
+
+    def install(self, missing):
+        command = self.table["install"]
+        if "items" not in self.table:
+            return install_commands([["bash", "-c", command]])
+        return install_commands(
+            [["bash", "-c", item_command(command, item.value)] for item in missing]
+        )
+
+
+class ManualGroup(InstallGroup):
+    """[[manual]]: things to install by hand (managed apps, installers without a cask).
+    Install checks for them, by 'app' or 'check', and lists the missing ones with how."""
+
+    section = "manual"
+    keys = ("name", "app", "check", "source", "url", "note")
+
+    def __init__(self, entries, config_name):
+        super().__init__({}, config_name)
+        names = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                fatal(f"{config_name}: each [[manual]] entry must be a table")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                fatal(f"{config_name}: a [[manual]] entry is missing its 'name'")
+            if name in names:
+                fatal(f"{config_name}: two [[manual]] entries are named '{name}'")
+            names.add(name)
+            install_keys(entry, self.keys, f"[[manual]] '{name}'", config_name)
+            for key in self.keys[1:]:
+                value = entry.get(key)
+                if value is not None and not (isinstance(value, str) and value.strip()):
+                    fatal(f"{config_name}: the '{key}' key in [[manual]] '{name}' must be text")
+            if not entry.get("app") and not entry.get("check"):
+                fatal(f"{config_name}: [[manual]] '{name}' needs an 'app' or a 'check'")
+        self.entries = entries
+
+    def items(self):
+        return [InstallItem(e["name"], f"'{e['name']}'", e) for e in self.entries]
+
+    def present(self):
+        installed = []
+        for item in self.items():
+            entry = item.value
+            if entry.get("app"):
+                found = app_find(entry["app"])
+            else:
+                found = install_check(entry["check"])
+            if found:
+                installed.append(item.key)
+        return InstallState(installed)
+
+    @staticmethod
+    def how(entry):
+        """Say how to install a manual entry: its source, url and note."""
+        parts = [entry[key] for key in ("source", "url", "note") if entry.get(key)]
+        return "; ".join(parts)
+
+    @staticmethod
+    def draft():
+        """List the apps that came neither from a cask nor the App Store, nor with macOS."""
+        apps = app_bundles()
+        ids = app_store_ids(apps)
+        cask_apps = set()
+        if install_which("brew"):
+            argv = ["brew", "info", "--cask", "--installed", "--json=v2"]
+            out = install_query(argv, "list the apps of the Homebrew casks")
+            try:
+                for cask in json.loads(out or "{}").get("casks", []):
+                    for artifact in cask.get("artifacts", []):
+                        # An app, or a 'suite' folder of apps (kicad)
+                        for kind in ("app", "suite"):
+                            if isinstance(artifact, dict) and kind in artifact:
+                                cask_apps |= {Path(str(a)).name for a in artifact[kind]}
+            except (ValueError, AttributeError, TypeError) as e:
+                error(f"Cannot read the apps of the Homebrew casks: {e}")
+        entries = []
+        names = set()
+        for app in apps:
+            from_cask = app.name in cask_apps or app.parent.name in cask_apps
+            if app in ids or from_cask or app_bundle_id(app).startswith("com.apple."):
+                continue
+            # /Applications/X.app is 'X.app'; anything else keeps its folder
+            main_dir = Path(INSTALL_APP_DIRS[0]).expanduser()
+            if app.is_relative_to(main_dir):
+                rel = str(app.relative_to(main_dir))
+            elif app.is_relative_to(Path.home()):
+                rel = "~/" + str(app.relative_to(Path.home()))
+            else:
+                rel = str(app)
+            # Names are unique: the same app in ~/Applications is named by its folder
+            name = app.stem if app.stem not in names else f"{app.stem} ({app.parent.name})"
+            names.add(name)
+            entries.append({"name": name, "app": rel})
+        return entries or None
+
+
+# The group class of each built-in section, in INSTALL_SECTIONS order
+INSTALL_GROUPS = {
+    "brew": BrewGroup,
+    "mas": MasGroup,
+    "custom": CustomGroup,
+    "mise": MiseGroup,
+    "npm": NpmGroup,
+    "cargo": CargoGroup,
+    "uv": UvGroup,
+    "vscode": VscodeGroup,
+    "manual": ManualGroup,
+}
+
+
+def install_order(config, config_name):
+    """Return the section order: [install] order, then the sections it leaves out."""
+    table = config.get("install", {})
+    if not isinstance(table, dict):
+        fatal(f"{config_name}: [install] must be a table")
+    install_keys(table, ("order",), "[install]", config_name)
+    order = install_names(table, "order", "[install]", config_name)
+    unknown = [name for name in order if name not in INSTALL_SECTIONS]
+    if unknown:
+        fatal(
+            f"{config_name}: unknown section '{unknown[0]}' in [install] order",
+            f"Sections: {', '.join(INSTALL_SECTIONS)}",
+        )
+    if len(set(order)) != len(order):
+        fatal(f"{config_name}: [install] order names a section twice")
+    return order + [name for name in INSTALL_SECTIONS if name not in order]
+
+
+def install_groups(config, config_name, only=None, skip=None):
+    """Build and verify every group of an install config, in install order.
+
+    A built-in section the config leaves out still gets an empty group, so a status can
+    show what that tool has installed. only and skip select sections by name.
+    """
+    unknown = [key for key in config if key != "install" and key not in INSTALL_SECTIONS]
+    if unknown:
+        fatal(
+            f"{config_name}: unknown table [{unknown[0]}]",
+            f"Tables: install, {', '.join(INSTALL_SECTIONS)}",
+        )
+
+    groups = []
+    for name in install_order(config, config_name):
+        value = config.get(name)
+        if name in ("custom", "manual"):
+            if value is None:
+                continue
+            if not isinstance(value, list):
+                fatal(f"{config_name}: {name} must be an array of tables: [[{name}]]")
+            if name == "custom":
+                titles = [entry.get("name") for entry in value if isinstance(entry, dict)]
+                twice = [title for title in titles if titles.count(title) > 1]
+                if twice:
+                    fatal(f"{config_name}: two [[custom]] entries are named '{twice[0]}'")
+                built = [CustomGroup(entry, config_name) for entry in value]
+            else:
+                built = [ManualGroup(value, config_name)]
+        else:
+            if value is None:
+                value = {}
+            if not isinstance(value, dict):
+                fatal(f"{config_name}: [{name}] must be a table")
+            built = [INSTALL_GROUPS[name](value, config_name)]
+            built[0].items()  # verifies its values
+        if (only and name not in only) or (skip and name in skip):
+            continue
+        groups += built
+    return groups
+
+
+def install_section_list(value):
+    """Parse a comma-separated list of install sections, for argparse."""
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    unknown = [name for name in names if name not in INSTALL_SECTIONS]
+    if not names or unknown:
+        shown_name = unknown[0] if unknown else value
+        raise argparse.ArgumentTypeError(
+            f"unknown section '{shown_name}' (sections: {', '.join(INSTALL_SECTIONS)})"
+        )
+    return names
+
+
+def install_status(groups, config_name):
+    """Show, per group, what is missing and what is installed but not in the config."""
+    emit(f"Install status for {root_shown(config_name)}")
+    missing_count = 0
+    extra_count = 0
+    skipped = 0
+    for group in groups:
+        items = group.items()
+        reason = group.unavailable()
+        if reason:
+            if items:
+                step_skipped(group.title, f"{reason}; {plural(len(items), 'item')} not checked")
+                skipped += len(items)
+            continue
+        # A section the config leaves out shows only when its tool installed something
+        if items:
+            step(f"Checking {group.title}")
+        state = group.present()
+        if state is None:
+            continue
+        extra = state.extra
+        if not items:
+            if not extra:
+                continue
+            step(f"Checking {group.title} (not in the config)")
+        missing = [item for item in items if item.key not in state.installed]
+        if items:
+            say(f"installed: {len(items) - len(missing)} of {len(items)}")
+        for item in missing:
+            how = ManualGroup.how(item.value) if group.section == "manual" else ""
+            say(f"missing: {item.label}" + (f" ({how})" if how else ""))
+        for label in extra:
+            say(f"not in config: {label}")
+        missing_count += len(missing)
+        extra_count += len(extra)
+
+    if not missing_count and not extra_count and not skipped:
+        finish("Everything in the config is installed, and nothing else")
+        return
+    parts = [f"{plural(missing_count, 'item')} missing", f"{extra_count} not in the config"]
+    if skipped:
+        parts.append(f"{skipped} not checked")
+    finish(f"Status: {', '.join(parts)}", False)
+
+
+def install_all(groups, config_name):
+    """Install what each group is missing, in order, then list what is left to do by hand."""
+    banner("install")
+    emit(f"Config: {root_shown(config_name)}", 1)
+
+    installed = 0
+    skipped = 0
+    by_hand = []
+    for group in groups:
+        items = group.items()
+        if not items:
+            continue
+        reason = group.unavailable()
+        if reason:
+            step_skipped(group.title, f"{reason}; {plural(len(items), 'item')} not installed")
+            skipped += len(items)
+            continue
+        state = group.present()
+        if state is None:
+            continue
+        missing = [item for item in items if item.key not in state.installed]
+        if group.section == "manual":
+            by_hand += missing
+            continue
+        if not missing:
+            step_skipped(group.title, f"{plural(len(items), 'item')} already installed")
+            continue
+
+        step(f"Installing {group.title}")
+        for item in missing:
+            say(f"missing: {item.label}")
+        failures = group.install(missing)
+        if __dry_run__:
+            continue
+
+        # The tool's exit status isn't the whole story (brew bundle exits 1 for one bad
+        # cask), so what is installed is looked up again
+        after = group.present()
+        done = [] if after is None else [item for item in missing if item.key in after.installed]
+        still = [item for item in missing if item not in done]
+        for item in done:
+            ok(f"{item.label} installed")
+        installed += len(done)
+        if still:
+            error(
+                f"Cannot install {plural(len(still), 'item')} from {group.title}",
+                *(item.label for item in still),
+                *failures,
+            )
+        elif failures:
+            warn(f"Some {group.title} commands failed, but everything is installed", *failures)
+
+    if by_hand:
+        step("Left to install by hand")
+        for item in by_hand:
+            how = ManualGroup.how(item.value)
+            say(item.label + (f": {how}" if how else ""))
+
+    parts = [f"{plural(installed, 'item')} installed"]
+    if by_hand:
+        parts.append(f"{len(by_hand)} left to install by hand")
+    if skipped:
+        parts.append(f"{skipped} skipped")
+    if not installed and not by_hand and not skipped and not _reported["errors"]:
+        parts = ["nothing was missing"]
+    finish(f"Install completed: {', '.join(parts)}", success=not by_hand and not skipped)
+
+
+def brewfile_text(groups):
+    """Return a Brewfile of the [brew] and [mas] groups' items."""
+    lines = []
+    for group in groups:
+        if group.section == "brew":
+            lines += [item.value for item in group.items()]
+        elif group.section == "mas":
+            apps = [item.value for item in group.items()]
+            if apps and 'brew "mas"' not in lines:
+                lines.append('brew "mas"')
+            lines += [f"mas {ruby_string(name)}, id: {app_id}" for name, app_id in apps]
+    return "\n".join(lines) + "\n" if lines else ""
+
+
+def draft_value_lines(key, value):
+    """Format one key of a draft: short arrays on one line, longer ones one item a line."""
+    if isinstance(value, list) and (len(value) > 3 or len(toml_value(value)) > 60):
+        return [f"{toml_key(key)} = ["] + [f"    {toml_value(v)}," for v in value] + ["]"]
+    return [f"{toml_key(key)} = {toml_value(value)}"]
+
+
+def draft_table_lines(path, table):
+    """Format a draft table: its values under [path], then its subtables."""
+    lines = []
+    values = {k: v for k, v in table.items() if not isinstance(v, dict)}
+    if values:
+        lines += ["", f"[{path}]"]
+        for key, value in values.items():
+            lines += draft_value_lines(key, value)
+    for key, value in table.items():
+        if isinstance(value, dict) and value:
+            lines += draft_table_lines(f"{path}.{toml_key(key)}", value)
+    return lines
+
+
+def install_draft_text(only=None, skip=None):
+    """Return (a draft install.toml of what is installed here, the number of items in it)."""
+    lines = [
+        f"# Draft of what is installed on {platform.node() or 'this machine'}, written by",
+        f"# 'molt.py install --draft' on {datetime.now().strftime('%Y-%m-%d')}.",
+        "# Review it before installing from it: molt.py install -t <this file> --dry-run",
+        "# [[manual]] lists the apps that came from neither a cask nor the App Store: install",
+        "# them by hand, or move them to [brew] casks. See configs/example-install.toml for",
+        "# [[custom]] commands (installers, rustup targets) and [install] order.",
+    ]
+    count = 0
+    for name in INSTALL_SECTIONS:
+        if name == "custom" or (only and name not in only) or (skip and name in skip):
+            continue
+        table = INSTALL_GROUPS[name].draft()
+        if not table:
+            continue
+        if name == "manual":
+            for entry in table:
+                lines += ["", "[[manual]]"]
+                lines += [f"{key} = {toml_value(value)}" for key, value in entry.items()]
+            count += len(table)
+            continue
+        lines += draft_table_lines(name, table)
+        for value in table.values():
+            count += len(value) if isinstance(value, (list, dict)) else 0
+    return "\n".join(lines) + "\n", count
+
+
+def install_output(path, text, what, force):
+    """Write text to path ('-' is stdout); an existing file is replaced only with force."""
+    if path == "-":
+        sys.stdout.write(text)
+        return False
+    target = Path(path).expanduser()
+    if (target.exists() or target.is_symlink()) and not force:
+        fatal(f"Cannot write {what} to {target}: it already exists", "Pass --force to replace it")
+    if __dry_run__:
+        say(f"{what}: {target}")
+        return True
+    try:
+        target.write_text(text, encoding="utf-8")
+    except OSError as e:
+        fatal(f"Cannot write {what} to {target}: {e.strerror or e}")
+    return True
+
+
+def install_draft_write(path):
+    """Write a draft install.toml into a snapshot, for 'draft = true' in capture.toml."""
+    step(f"Writing {DRAFT_INSTALL_TOML}")
+    if __dry_run__:
+        say(f"draft of what is installed: {shown(path)}")
+        return
+    text, count = install_draft_text()
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as e:
+        fatal(f"Cannot write {path}: {e.strerror or e}")
+    ok(f"{DRAFT_INSTALL_TOML} written ({plural(count, 'item')})")
+
+
 # --- Command Execution --- #
 
 
@@ -4065,7 +5253,7 @@ def cmd_check(args):
     files = getattr(args, "files", []) or []
 
     if not files:
-        fatal("No files given", "Usage: snap.py check [options] file [file ...]")
+        fatal("No files given", "Usage: molt.py check [options] file [file ...]")
 
     ignore_invalid = getattr(args, "ignore_invalid", False)
     short_hash = getattr(args, "short_hash", False)
@@ -4106,7 +5294,7 @@ def cmd_capture(args):
     to_host, to_path = parse_remote_arg(getattr(args, "dst", None), flag="--to")
     require_remote(args, "src", from_host)
 
-    # A remote snap root keeps its captures on its host (root_dir is only a local copy
+    # A remote molt root keeps its captures on its host (root_dir is only a local copy
     # of its configs and scripts)
     if root_host and not to_host and not to_path:
         to_host = root_host
@@ -4119,7 +5307,7 @@ def cmd_capture(args):
     if to_host and to_path:
         intended_path = normalize_remote_path(to_path)
     elif to_host:
-        intended_path = remote_snap_root(args, to_host) / "captures" / year / month_day
+        intended_path = remote_molt_root(args, to_host) / "captures" / year / month_day
     elif to_path:
         intended_path = to_path.resolve()
     else:
@@ -4192,7 +5380,7 @@ def cmd_capture(args):
 
 
 def cmd_list(args):
-    """List the snapshots in the snap root's captures directory, and their backup dirs."""
+    """List the snapshots in the molt root's captures directory, and their backup dirs."""
     captures_dir = args.root / "captures"
     snapshots = snapshots_find(captures_dir)
     if not snapshots:
@@ -4241,7 +5429,7 @@ def cmd_prune(args):
     if keep is None and older_than is None:
         fatal(
             "Nothing to prune by: pass --keep N, --older-than DAYS, or both",
-            "Usage: snap.py prune [--keep N] [--older-than DAYS] [--backups] [--yes]",
+            "Usage: molt.py prune [--keep N] [--older-than DAYS] [--backups] [--yes]",
         )
 
     banner("prune")
@@ -4348,6 +5536,42 @@ def cmd_migrate(args):
             shutil.rmtree(tmpdir)
 
 
+def cmd_install(args):
+    """Install what install.toml lists, or show its status, write its Brewfile or a draft."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        fatal(
+            "Cannot run molt.py install as root: Homebrew refuses to run as root",
+            "Run it as your user; installers ask for sudo when they need it",
+        )
+    only, skip = args.only, args.skip
+
+    if args.draft:
+        text, count = install_draft_text(only, skip)
+        if install_output(args.draft, text, "the draft", args.force):
+            finish(f"Draft of {plural(count, 'item')} written to {Path(args.draft).expanduser()}")
+        return
+
+    config_name = args.config_toml or DEFAULT_CONFIG_INSTALL
+    config = load_config(args.root, config_name)
+    groups = install_groups(config, config_name, only, skip)
+    shown_config = args.root / config_name
+
+    if args.brewfile:
+        text = brewfile_text(groups)
+        if not text:
+            fatal(f"{config_name} lists nothing for a Brewfile (no [brew] or [mas] items)")
+        if install_output(args.brewfile, text, "the Brewfile", args.force):
+            finish(f"Brewfile written to {Path(args.brewfile).expanduser()}")
+        return
+
+    if args.status:
+        install_status(groups, shown_config)
+    else:
+        install_all(groups, shown_config)
+        if _reported["errors"] and not __dry_run__:
+            sys.exit(1)
+
+
 def cmd_restore(args):
     """Execute restore command (local or remote)."""
     root_dir = args.root
@@ -4357,7 +5581,7 @@ def cmd_restore(args):
     to_host, _ = parse_remote_arg(getattr(args, "dst", None), flag="--to")
     require_remote(args, "dst", to_host)
 
-    # A remote snap root restores the latest snapshot in its own captures directory,
+    # A remote molt root restores the latest snapshot in its own captures directory,
     # unless --from names another snapshot
     if root_host and not from_host and not from_path:
         from_host = root_host
@@ -4365,7 +5589,7 @@ def cmd_restore(args):
     banner("restore")
     dest = to_host or here()
 
-    # Determine snapshot source path; latest is set when snap.py chose the snapshot
+    # Determine snapshot source path; latest is set when molt.py chose the snapshot
     latest = False
     if from_host:
         # Remote source: the given path (relative to the login directory unless
@@ -4374,7 +5598,7 @@ def cmd_restore(args):
             capture_path = normalize_remote_path(from_path)
             context(f"{from_host}:{capture_path}", dest)
         else:
-            captures_dir = remote_snap_root(args, from_host) / "captures"
+            captures_dir = remote_molt_root(args, from_host) / "captures"
             context(f"{from_host}:{captures_dir} (latest)", dest)
             capture_path = resolve_remote_snapshot(from_host, captures_dir)
     elif from_path:
@@ -4398,7 +5622,7 @@ def cmd_restore(args):
                         "or a date directory that holds one"
                     )
                 else:
-                    hint = "Run 'snap.py capture' first, or pass --from <snapshot>"
+                    hint = "Run 'molt.py capture' first, or pass --from <snapshot>"
                 fatal(f"No snapshots found in {capture_path}", hint)
 
             capture_path = max(subdirs, key=lambda d: d.stat().st_mtime)
@@ -4460,7 +5684,7 @@ def add_cli_options(parser):
 
 
 def add_root_option(group, local=False):
-    """Add the -r/--snap-root option; local=True for commands that take only a local root."""
+    """Add the -r/--molt-root option; local=True for commands that take only a local root."""
     if local:
         metavar = "root"
         where = ""
@@ -4468,11 +5692,11 @@ def add_root_option(group, local=False):
         metavar = "[[user@]host:]root"
         where = f"; on a host, {DEFAULT_REMOTE_ROOT} in its login directory"
     group.add_argument(
-        "-r", "--snap-root", dest="root", metavar=metavar,
-        default=DEFAULT_ROOT_SNAP,
+        "-r", "--molt-root", dest="root", metavar=metavar,
+        default=DEFAULT_ROOT,
         help=(
-            "Snap root with configs, scripts and captures "
-            f"(default: ./.snap, then {DEFAULT_ROOT_SNAP}{where})"
+            "Molt root with configs, scripts and captures "
+            f"(default: ./.molt, then {DEFAULT_ROOT}{where})"
         ),
     )
 
@@ -4488,17 +5712,17 @@ def non_negative(value):
     return number
 
 
-def add_snap_options(parser):
-    """Add shared snap configuration options."""
-    group = parser.add_argument_group("snap options")
+def add_molt_options(parser):
+    """Add shared molt configuration options."""
+    group = parser.add_argument_group("molt options")
     add_root_option(group)
     group.add_argument(
         "-t", "--config-toml", dest="config_toml", metavar="config",
-        help="Config file, relative to the snap root, instead of the command default",
+        help="Config file, relative to the molt root, instead of the command default",
     )
     group.add_argument(
         "--run-scripts", action="store_true",
-        help="Run the config's before/after scripts (on a host, snap.py there runs them)",
+        help="Run the config's before/after scripts (on a host, molt.py there runs them)",
     )
 
 
@@ -4527,7 +5751,7 @@ def setup_parser():
         formatter_class=formatter,
         description=(
             "Capture, restore and migrate file snapshots, locally or over SSH; "
-            "list and prune them"
+            "list and prune them; install the packages a machine needs"
         ),
     )
 
@@ -4572,7 +5796,7 @@ def setup_parser():
         "capture", formatter_class=formatter, add_help=False,
         help="Capture a snapshot (on this machine or a host)",
     )
-    add_snap_options(cap)
+    add_molt_options(cap)
     add_host_options(
         cap,
         from_help="Host to capture on (default: this machine)",
@@ -4588,7 +5812,7 @@ def setup_parser():
         "restore", formatter_class=formatter, add_help=False,
         help="Restore a snapshot (on this machine or a host)",
     )
-    add_snap_options(rst)
+    add_molt_options(rst)
     add_host_options(
         rst,
         from_help=(
@@ -4609,7 +5833,7 @@ def setup_parser():
         "migrate", formatter_class=formatter, add_help=False,
         help="Capture on one machine and restore on another (at least one must be a host)",
     )
-    add_snap_options(mig)
+    add_molt_options(mig)
     add_host_options(
         mig,
         from_help="Host to capture on (default: this machine)",
@@ -4625,9 +5849,9 @@ def setup_parser():
     # list
     lst = subparsers.add_parser(
         "list", formatter_class=formatter, add_help=False,
-        help="List the snapshots in the snap root and the backup dirs of their roots",
+        help="List the snapshots in the molt root and the backup dirs of their roots",
     )
-    add_root_option(lst.add_argument_group("snap options"), local=True)
+    add_root_option(lst.add_argument_group("molt options"), local=True)
     lst.add_argument_group("output options").add_argument(
         "--help", action="help",
         help="Show this help message and exit",
@@ -4638,7 +5862,7 @@ def setup_parser():
         "prune", formatter_class=formatter, add_help=False,
         help="Delete old snapshots (and old backup dirs), after asking",
         description=(
-            "Delete old snapshots from the snap root's captures directory. A snapshot is\n"
+            "Delete old snapshots from the molt root's captures directory. A snapshot is\n"
             "deleted only when no rule you give keeps it: --keep N keeps the newest N, and\n"
             "--older-than DAYS keeps those from the last DAYS days. With --backups, the\n"
             "same rules apply to each root's rotated backup dirs (<root><rollback>_<time>),\n"
@@ -4647,7 +5871,7 @@ def setup_parser():
             "delete are kept and reported with the sudo command to run."
         ),
     )
-    add_root_option(prn.add_argument_group("snap options"), local=True)
+    add_root_option(prn.add_argument_group("molt options"), local=True)
     prn_group = prn.add_argument_group("prune options")
     prn_group.add_argument(
         "--keep", type=non_negative, metavar="N",
@@ -4667,6 +5891,57 @@ def setup_parser():
     )
     add_cli_options(prn)
 
+    # install
+    ins = subparsers.add_parser(
+        "install", formatter_class=formatter, add_help=False,
+        help="Install the packages and apps install.toml lists, or show what is missing",
+        description=(
+            "Install what configs/install.toml lists and this machine is missing: Homebrew\n"
+            "taps, formulae and casks, App Store apps, mise runtimes, npm, cargo and uv\n"
+            "tools, VS Code extensions, and [[custom]] commands, in that order unless\n"
+            "[install] order sets another. Nothing installed is upgraded. [[manual]]\n"
+            "entries are only checked, and listed at the end as left to install by hand.\n"
+            "--status shows what is missing and what is installed but not in the config;\n"
+            "--draft writes a config of what is installed here, to start one from."
+        ),
+    )
+    ins_molt = ins.add_argument_group("molt options")
+    add_root_option(ins_molt, local=True)
+    ins_molt.add_argument(
+        "-t", "--config-toml", dest="config_toml", metavar="config",
+        help=(
+            f"Install config, relative to the molt root or absolute "
+            f"(default: {DEFAULT_CONFIG_INSTALL})"
+        ),
+    )
+    ins_group = ins.add_argument_group("install options")
+    ins_mode = ins_group.add_mutually_exclusive_group()
+    ins_mode.add_argument(
+        "--status", action="store_true",
+        help="Show what is missing and what is installed but not in the config; install nothing",
+    )
+    ins_mode.add_argument(
+        "--brewfile", metavar="file",
+        help="Write the config's [brew] and [mas] items as a Brewfile ('-' for stdout)",
+    )
+    ins_mode.add_argument(
+        "--draft", metavar="file",
+        help="Write a draft config of what is installed on this machine ('-' for stdout)",
+    )
+    ins_group.add_argument(
+        "--only", type=install_section_list, metavar="sections",
+        help=f"Only these sections, comma-separated ({', '.join(INSTALL_SECTIONS)})",
+    )
+    ins_group.add_argument(
+        "--skip", type=install_section_list, metavar="sections",
+        help="Leave out these sections, comma-separated",
+    )
+    ins_group.add_argument(
+        "--force", action="store_true",
+        help="Let --brewfile and --draft replace an existing file",
+    )
+    add_cli_options(ins)
+
     # Top-level help only
     parser.add_argument(
         "--help", action="help",
@@ -4676,7 +5951,7 @@ def setup_parser():
     # main() reports unknown flags with the subcommand's own usage
     parser.commands = {
         "check": check, "capture": cap, "restore": rst, "migrate": mig,
-        "list": lst, "prune": prn,
+        "list": lst, "prune": prn, "install": ins,
     }
     return parser
 
@@ -4708,8 +5983,8 @@ def main():
     __dry_run__ = getattr(args, "dry_run", False)
     __verbose__ = getattr(args, "verbose", False)
 
-    # Parse --snap-root for remote host support
-    root_host, root_path = parse_remote_arg(args.root, flag="-r/--snap-root")
+    # Parse --molt-root for remote host support
+    root_host, root_path = parse_remote_arg(args.root, flag="-r/--molt-root")
     args.root_host = root_host
 
     # Each command prints its own banner after checking its arguments
@@ -4719,18 +5994,19 @@ def main():
         "migrate": cmd_migrate,
         "list": cmd_list,
         "prune": cmd_prune,
+        "install": cmd_install,
     }
-    if root_host and args.command in ("list", "prune"):
+    if root_host and args.command in ("list", "prune", "install"):
         fatal(
-            f"snap.py {args.command} works only with a local snap root, not '{args.root}'",
-            f"Run snap.py {args.command} on {root_host} itself",
+            f"molt.py {args.command} works only with a local molt root, not '{args.root}'",
+            f"Run molt.py {args.command} on {root_host} itself",
         )
     if not root_host:
         args.root = resolve_root(args.root)
         commands[args.command](args)
         return
 
-    # A remote snap root: (root_host, root_path) name it on its host, and args.root is a
+    # A remote molt root: (root_host, root_path) name it on its host, and args.root is a
     # local copy of its configs/ and scripts/ (made in a dry run too), removed at exit
     args.root_path = normalize_remote_path(root_path or DEFAULT_REMOTE_ROOT)
     args.root = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-root-"))

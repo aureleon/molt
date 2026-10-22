@@ -1,8 +1,8 @@
-"""Regression tests for snap.py.
+"""Regression tests for molt.py.
 
 Run with: python3 -m pytest tests/
 
-End-to-end tests run snap.py in a subprocess with HOME pointed at a temp dir and a
+End-to-end tests run molt.py in a subprocess with HOME pointed at a temp dir and a
 fake `sudo` first on PATH, so they never touch the real home or escalate privileges.
 """
 
@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import tomllib
 
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,9 +31,9 @@ import tqdm
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-import snap  # noqa: E402
+import molt  # noqa: E402
 
-SNAP = REPO / "snap.py"
+MOLT = REPO / "molt.py"
 
 
 # --- Helpers --- #
@@ -47,10 +48,10 @@ def write_files(root, files):
 
 
 def make_archive(tmp_path, name, root, paths):
-    """Create a gzip category archive with snap.archive_create."""
+    """Create a gzip category archive with molt.archive_create."""
     outdir = tmp_path / "archives"
     outdir.mkdir(exist_ok=True)
-    archive, _, _ = snap.archive_create(name, str(root), paths, outdir)
+    archive, _, _ = molt.archive_create(name, str(root), paths, outdir)
     return archive
 
 
@@ -73,7 +74,7 @@ def backup_files(tmp_path, name):
 def reset_copy_failure():
     """Clear the module-level copy-failure flag so tests stay order-independent."""
     yield
-    snap._copy_failed.clear()
+    molt._copy_failed.clear()
 
 
 unprivileged = pytest.mark.skipif(os.geteuid() == 0, reason="needs an unprivileged user")
@@ -82,10 +83,10 @@ unprivileged_only = unprivileged
 
 @pytest.fixture
 def env(tmp_path):
-    """A temp HOME, snap root, and fake sudo for end-to-end runs."""
+    """A temp HOME, molt root, and fake sudo for end-to-end runs."""
     home = tmp_path / "home"
     home.mkdir()
-    root = tmp_path / "snaproot"
+    root = tmp_path / "moltroot"
     (root / "configs").mkdir(parents=True)
 
     bin_dir = tmp_path / "bin"
@@ -119,7 +120,7 @@ def env(tmp_path):
         # answers is the text typed at the prompts; without it stdin is empty
         stdin = {"input": answers} if answers is not None else {"stdin": subprocess.DEVNULL}
         return subprocess.run(
-            [sys.executable, str(SNAP), *args],
+            [sys.executable, str(MOLT), *args],
             cwd=tmp_path,
             env=dict(run_env, **(extra_env or {})),
             capture_output=True,
@@ -155,7 +156,7 @@ def test_archive_entries_returns_captured_paths(tmp_path):
     archive = make_archive(tmp_path, "cat", tmp_path / "src", [".config/nvim", ".zshrc"])
 
     with tarfile.open(archive) as tar:
-        assert list(snap.archive_entries(tar)) == [".config/nvim", ".zshrc"]
+        assert list(molt.archive_entries(tar)) == [".config/nvim", ".zshrc"]
 
 
 def test_archive_entries_skips_members_below_symlinks(tmp_path):
@@ -170,7 +171,7 @@ def test_archive_entries_skips_members_below_symlinks(tmp_path):
         tar.addfile(info, io.BytesIO(b"new"))
 
     with tarfile.open(archive) as tar:
-        groups = snap.archive_entries(tar)
+        groups = molt.archive_entries(tar)
     assert {entry: [m.name for m in members] for entry, members in groups.items()} == {
         ".config": [".config"],
     }
@@ -186,7 +187,7 @@ def test_archive_entries_rejects_unsafe_paths(tmp_path, name):
 
     with tarfile.open(archive) as tar:
         with pytest.raises(ValueError):
-            snap.archive_entries(tar)
+            molt.archive_entries(tar)
 
 
 def test_restore_keeps_uncaptured_siblings(tmp_path):
@@ -201,8 +202,8 @@ def test_restore_keeps_uncaptured_siblings(tmp_path):
     nvim = make_archive(tmp_path, "nvim", src, [".config/nvim"])
     fish = make_archive(tmp_path, "fish", src, [".config/fish"])
 
-    assert snap.restore_category(nvim, str(home), ".bak")
-    assert snap.restore_category(fish, str(home), ".bak")
+    assert molt.restore_category(nvim, str(home), ".bak")
+    assert molt.restore_category(fish, str(home), ".bak")
 
     assert list_tree(home) == [
         ".config",
@@ -229,7 +230,7 @@ def test_restore_rejects_unsafe_archive_without_deleting(tmp_path):
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(outside, arcname="../outside")
 
-    assert not snap.restore_category(archive, str(home), ".bak")
+    assert not molt.restore_category(archive, str(home), ".bak")
     assert (outside / "keep.txt").read_text() == "keep"
     assert not (tmp_path / "home.bak").exists()
 
@@ -266,7 +267,7 @@ def test_rollback_restores_the_failing_entry(tmp_path, monkeypatch):
 
     fail_on_extract(monkeypatch, "b", OSError("disk full"))
 
-    assert not snap.restore_category(archive, str(home), ".bak")
+    assert not molt.restore_category(archive, str(home), ".bak")
     assert list_tree(home) == ["a", "a/orig.txt", "b", "b/orig.txt"]
 
 
@@ -279,7 +280,7 @@ def test_rollback_removes_new_paths_and_created_parents(tmp_path, monkeypatch):
 
     fail_on_extract(monkeypatch, "zz", OSError("disk full"))
 
-    assert not snap.restore_category(archive, str(home), ".bak")
+    assert not molt.restore_category(archive, str(home), ".bak")
     assert list_tree(home) == ["a", "a/orig.txt"]
 
 
@@ -291,17 +292,17 @@ def test_incomplete_rollback_stops_restore(tmp_path, monkeypatch, capsys):
     archive = make_archive(tmp_path, "cat", src, ["a", "zz"])
 
     fail_on_extract(monkeypatch, "zz", OSError("disk full"))
-    original_move = snap.move_path
+    original_move = molt.move_path
 
     def move(src_path, dst_path):
         if ".bak" in str(src_path):
             raise OSError("read-only file system")
         return original_move(src_path, dst_path)
 
-    monkeypatch.setattr(snap, "move_path", move)
+    monkeypatch.setattr(molt, "move_path", move)
 
     with pytest.raises(SystemExit):
-        snap.restore_category(archive, str(home), ".bak")
+        molt.restore_category(archive, str(home), ".bak")
     assert "backups are in" in capsys.readouterr().err
     assert (tmp_path / "home.bak" / "cat" / "a" / "orig.txt").read_text() == "a"
 
@@ -318,10 +319,10 @@ def test_rollback_runs_even_if_reporting_fails(tmp_path, monkeypatch):
     def broken_stderr(*args, **kwargs):
         raise BrokenPipeError
 
-    monkeypatch.setattr(snap, "error", broken_stderr)
+    monkeypatch.setattr(molt, "error", broken_stderr)
 
     with pytest.raises(BrokenPipeError):
-        snap.restore_category(archive, str(home), ".bak")
+        molt.restore_category(archive, str(home), ".bak")
     assert list_tree(home) == ["a", "a/orig.txt", "b", "b/orig.txt"]
 
 
@@ -335,7 +336,7 @@ def test_rollback_runs_on_keyboard_interrupt(tmp_path, monkeypatch):
     fail_on_extract(monkeypatch, "a", KeyboardInterrupt())
 
     with pytest.raises(KeyboardInterrupt):
-        snap.restore_category(archive, str(home), ".bak")
+        molt.restore_category(archive, str(home), ".bak")
     assert list_tree(home) == ["a", "a/orig.txt"]
 
 
@@ -351,7 +352,7 @@ def test_rollback_removes_read_only_dirs_from_archive(tmp_path, monkeypatch):
 
     fail_on_extract(monkeypatch, "zz", OSError("disk full"))
 
-    assert not snap.restore_category(archive, str(home), ".bak")
+    assert not molt.restore_category(archive, str(home), ".bak")
     assert list_tree(home) == []
 
 
@@ -363,7 +364,7 @@ def test_cross_group_hardlink_links_to_restored_file(tmp_path):
     write_files(home, {"a/x": "old", "b/y": "old"})
     archive = make_archive(tmp_path, "cat", src, ["b/z", "a", "b"])
 
-    assert snap.restore_category(archive, str(home), ".bak")
+    assert molt.restore_category(archive, str(home), ".bak")
 
     assert (home / "a" / "x").read_text() == "new"
     assert (home / "b" / "y").read_text() == "new"
@@ -377,8 +378,8 @@ def record_chown(monkeypatch):
     def chown(path, uid, gid, *, follow_symlinks=True):
         calls[Path(path)] = (uid, gid, follow_symlinks)
 
-    monkeypatch.setattr(snap.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(snap.os, "chown", chown)
+    monkeypatch.setattr(molt.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(molt.os, "chown", chown)
     return calls
 
 
@@ -391,7 +392,7 @@ def test_new_dirs_get_nearest_ancestor_owner_as_root(tmp_path, monkeypatch):
     calls = record_chown(monkeypatch)
     home_owner = (home.stat().st_uid, home.stat().st_gid, True)
 
-    assert snap.restore_category(archive, str(home / ".local" / "share"), ".bak")
+    assert molt.restore_category(archive, str(home / ".local" / "share"), ".bak")
 
     for new_dir in [".local", ".local/share", ".local/share.bak"]:
         assert calls[home / new_dir] == home_owner
@@ -403,7 +404,7 @@ def test_copy_with_ownership_never_follows_links_as_root(tmp_path, monkeypatch):
     (src / "dir" / "link").symlink_to("/etc/hosts")
     calls = record_chown(monkeypatch)
 
-    snap.copy_with_ownership(src / "dir", tmp_path / "copy")
+    molt.copy_with_ownership(src / "dir", tmp_path / "copy")
 
     assert set(calls) == {tmp_path / "copy", tmp_path / "copy/f.txt", tmp_path / "copy/link"}
     assert all(follow is False for _, _, follow in calls.values())
@@ -419,7 +420,7 @@ def test_restore_over_symlinked_dir_keeps_link_target(tmp_path):
     (home / ".config" / "nvim").symlink_to(dotfiles / "nvim")
     archive = make_archive(tmp_path, "nvim", src, [".config/nvim"])
 
-    assert snap.restore_category(archive, str(home), ".bak")
+    assert molt.restore_category(archive, str(home), ".bak")
 
     restored = home / ".config" / "nvim"
     assert not restored.is_symlink()
@@ -436,11 +437,11 @@ def test_repeated_restores_rotate_backups_without_collision(tmp_path, monkeypatc
     archive = make_archive(tmp_path, "cat", src, ["a.txt"])
 
     # Freeze the clock so every rotation gets the same timestamp
-    frozen = snap.datetime(2026, 1, 2, 3, 4, 5)
-    monkeypatch.setattr(snap, "datetime", type("D", (), {"now": staticmethod(lambda: frozen)}))
+    frozen = molt.datetime(2026, 1, 2, 3, 4, 5)
+    monkeypatch.setattr(molt, "datetime", type("D", (), {"now": staticmethod(lambda: frozen)}))
 
     for _ in range(3):
-        assert snap.restore_category(archive, str(home), ".bak")
+        assert molt.restore_category(archive, str(home), ".bak")
 
     backups = [p.read_text() for p in sorted(tmp_path.glob("home.bak*/cat/a.txt"))]
     assert sorted(backups) == ["new", "new", "old"]
@@ -473,9 +474,9 @@ def test_dry_run_archive_extract_changes_nothing(tmp_path, monkeypatch):
     write_files(dst, {"a.txt": "old"})
     archive = make_archive(tmp_path, "cat", src, ["a.txt"])
 
-    monkeypatch.setattr(snap, "__dry_run__", True)
-    assert snap.archive_extract(archive, root=str(dst))
-    assert snap.extract_archives([archive], root_map={"cat": str(dst)}) == 1
+    monkeypatch.setattr(molt, "__dry_run__", True)
+    assert molt.archive_extract(archive, root=str(dst))
+    assert molt.extract_archives([archive], root_map={"cat": str(dst)}) == 1
 
     assert (dst / "a.txt").read_text() == "old"
 
@@ -496,7 +497,7 @@ def test_extract_archives_skips_members_below_symlinks(tmp_path):
         info.size = 3
         tar.addfile(info, io.BytesIO(b"new"))
 
-    assert snap.archive_extract(archive, root=str(dst))
+    assert molt.archive_extract(archive, root=str(dst))
     assert (dotfiles / "nvim" / "init.lua").read_text() == "user edit"
 
 
@@ -524,12 +525,12 @@ def test_e2e_restore_to_closed_stdout_pipe_changes_nothing(env):
     assert env.run("capture", "-r", str(env.root)).returncode == 0
     write_files(env.home, {".zshrc": "edited"})
 
-    # The pipe's reader is gone before snap.py writes anything
+    # The pipe's reader is gone before molt.py writes anything
     read_fd, write_fd = os.pipe()
     os.close(read_fd)
     try:
         result = subprocess.run(
-            [sys.executable, str(SNAP), "restore", "-r", str(env.root)],
+            [sys.executable, str(MOLT), "restore", "-r", str(env.root)],
             cwd=env.tmp, env=env.env, stdin=subprocess.DEVNULL, stdout=write_fd,
             stderr=subprocess.PIPE, text=True, timeout=120,
         )
@@ -559,11 +560,11 @@ def test_e2e_restore_with_latin1_stdout_changes_nothing(env):
 
 
 def test_path_writable_checks_nearest_existing_parent(tmp_path):
-    assert snap.path_writable(tmp_path / "missing" / "deeper")
+    assert molt.path_writable(tmp_path / "missing" / "deeper")
     if os.geteuid() != 0:
         locked = tmp_path / "locked"
         locked.mkdir(mode=0o555)
-        assert not snap.path_writable(locked / "missing")
+        assert not molt.path_writable(locked / "missing")
 
 
 @unprivileged
@@ -572,7 +573,7 @@ def test_path_writable_below_unsearchable_dir(tmp_path):
     (locked / "sub").mkdir(parents=True)
     locked.chmod(0)
     try:
-        assert not snap.path_writable(locked / "sub" / "missing")
+        assert not molt.path_writable(locked / "sub" / "missing")
     finally:
         locked.chmod(0o755)
 
@@ -580,13 +581,13 @@ def test_path_writable_below_unsearchable_dir(tmp_path):
 def needs_sudo(tmp_path, root, paths, roll_ext=".bak", snapshot_config=None):
     """Capture paths under root and check if restoring them back needs sudo."""
     archive = make_archive(tmp_path, "cat", root, paths)
-    return snap.restore_needs_sudo([archive], {"cat": str(root)}, roll_ext, snapshot_config or {})
+    return molt.restore_needs_sudo([archive], {"cat": str(root)}, roll_ext, snapshot_config or {})
 
 
 def other_backup_device(monkeypatch):
     """Make every backup dir look like it is on another filesystem than its root."""
-    real_device = snap.path_device
-    monkeypatch.setattr(snap, "path_device", lambda path: real_device(path) + 1)
+    real_device = molt.path_device
+    monkeypatch.setattr(molt, "path_device", lambda path: real_device(path) + 1)
 
 
 @unprivileged
@@ -626,7 +627,7 @@ def test_needs_sudo_in_a_sticky_dir_for_others_paths(tmp_path, monkeypatch):
     try:
         assert not needs_sudo(tmp_path, shared, ["a.txt"])
         # In a sticky dir only the owner of a path (or of the dir) can rename it
-        monkeypatch.setattr(snap.os, "geteuid", lambda: os.getuid() + 1)
+        monkeypatch.setattr(molt.os, "geteuid", lambda: os.getuid() + 1)
         assert needs_sudo(tmp_path, shared, ["a.txt"])
     finally:
         shared.chmod(0o755)
@@ -665,10 +666,10 @@ def test_needs_sudo_for_unreadable_file_inside_captured_path(tmp_path, monkeypat
     (home / "gcloud" / "credentials.db").chmod(0)
     try:
         # A rename never reads the file
-        assert not snap.restore_needs_sudo([archive], {"cat": str(home)}, ".bak", {})
+        assert not molt.restore_needs_sudo([archive], {"cat": str(home)}, ".bak", {})
         # A copy to a backup dir on another filesystem does
         other_backup_device(monkeypatch)
-        assert snap.restore_needs_sudo([archive], {"cat": str(home)}, ".bak", {})
+        assert molt.restore_needs_sudo([archive], {"cat": str(home)}, ".bak", {})
     finally:
         (home / "gcloud" / "credentials.db").chmod(0o644)
 
@@ -680,7 +681,7 @@ def test_needs_sudo_for_unreadable_archive(tmp_path):
     archive = make_archive(tmp_path, "cat", home, ["a.txt"])
     archive.chmod(0)
     try:
-        assert snap.restore_needs_sudo([archive], {"cat": str(home)}, ".bak", {})
+        assert molt.restore_needs_sudo([archive], {"cat": str(home)}, ".bak", {})
     finally:
         archive.chmod(0o644)
 
@@ -708,7 +709,7 @@ def test_sudo_restore_runs_child_on_local_copy(tmp_path, monkeypatch):
             assert Path(calls[0][2]).exists()
             return 3
 
-    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(molt.subprocess, "Popen", FakePopen)
     monkeypatch.setenv("HOME", "/Users/someone")
     monkeypatch.setenv("XDG_DATA_HOME", "/Users/someone/.local/share")
     args = argparse.Namespace(root_host=None, disable_rollback=True, run_scripts=True)
@@ -723,7 +724,7 @@ def test_sudo_restore_runs_child_on_local_copy(tmp_path, monkeypatch):
     }}
 
     with pytest.raises(SystemExit) as exit_info:
-        snap.sudo_restore(args, tmp_path / "root", tmp_path / "cap", restore_config,
+        molt.sudo_restore(args, tmp_path / "root", tmp_path / "cap", restore_config,
                           snapshot_config)
 
     assert exit_info.value.code == 3
@@ -732,11 +733,11 @@ def test_sudo_restore_runs_child_on_local_copy(tmp_path, monkeypatch):
         "sudo", "env",
         "HOME=/Users/someone",
         "XDG_DATA_HOME=/Users/someone/.local/share",
-        sys.executable, "-s", str(snap.__script__), "restore",
+        sys.executable, "-s", str(molt.__script__), "restore",
         "--from", str(tmp_path / "cap"), "-r", str(tmp_path / "root"), "-t", config_path,
         "--disable-rollback", "--run-scripts",
     ]
-    assert snap.tomllib.loads(config_text) == {
+    assert molt.tomllib.loads(config_text) == {
         "tar": {"archives": ["dots*", "🚀\x7f"]},
         "scripts": {"after": ["s.sh"]},
     }
@@ -754,21 +755,21 @@ def test_sudo_restore_keeps_skip_restore_semantics(tmp_path, monkeypatch, archiv
         def wait(self):
             return -2
 
-    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(molt.subprocess, "Popen", FakePopen)
     args = argparse.Namespace(root_host=None)
 
     with pytest.raises(SystemExit) as exit_info:
-        snap.sudo_restore(args, tmp_path, tmp_path, {"tar": {"archives": archives}}, {})
+        molt.sudo_restore(args, tmp_path, tmp_path, {"tar": {"archives": archives}}, {})
 
     assert exit_info.value.code == 130  # killed by SIGINT, like a shell reports it
-    assert snap.tomllib.loads(configs[0]) == {"tar": {"archives": []}}
+    assert molt.tomllib.loads(configs[0]) == {"tar": {"archives": []}}
 
 
 SITECUSTOMIZE = """
 import os
-if os.environ.get("SNAP_TEST_FAKE_ROOT"):
+if os.environ.get("MOLT_TEST_FAKE_ROOT"):
     os.geteuid = lambda: 0
-elif os.environ.get("SNAP_TEST_FORCE_SUDO"):
+elif os.environ.get("MOLT_TEST_FORCE_SUDO"):
     real_access = os.access
 
     def access(path, mode, *args, **kwargs):
@@ -793,13 +794,13 @@ def test_e2e_sudo_child_restores_from_local_copy(env):
     (site / "sitecustomize.py").write_text(SITECUSTOMIZE)
     env.sudo.write_text(
         '#!/bin/sh\necho "$@" > "$SUDO_MARKER"\n'
-        "export SNAP_TEST_FAKE_ROOT=1\nunset SNAP_TEST_FORCE_SUDO\nexec \"$@\"\n"
+        "export MOLT_TEST_FAKE_ROOT=1\nunset MOLT_TEST_FORCE_SUDO\nexec \"$@\"\n"
     )
     tmpdir = env.tmp / "tmpdir"
     tmpdir.mkdir()
 
     result = env.run("restore", "-r", str(env.root), extra_env={
-        "SNAP_TEST_FORCE_SUDO": "1",
+        "MOLT_TEST_FORCE_SUDO": "1",
         "PYTHONPATH": f"{site}{os.pathsep}{env.env['PYTHONPATH']}",
         "TMPDIR": str(tmpdir),
     })
@@ -917,14 +918,14 @@ def test_e2e_dry_run_does_not_run_scripts(env):
     ("user@host", ("user@host", None)),
     ("user@host:", ("user@host", None)),
     ("host:", ("host", None)),
-    ("host:/srv/snap", ("host", Path("/srv/snap"))),
-    ("user@host:~/snap", ("user@host", Path("~/snap"))),
+    ("host:/srv/molt", ("host", Path("/srv/molt"))),
+    ("user@host:~/molt", ("user@host", Path("~/molt"))),
     ("./name@tag", (None, Path("./name@tag"))),
     ("/abs/path", (None, Path("/abs/path"))),
     ("relative/path", (None, Path("relative/path"))),
 ])
 def test_parse_remote_arg(value, expected):
-    assert snap.parse_remote_arg(value) == expected
+    assert molt.parse_remote_arg(value) == expected
 
 
 @pytest.mark.parametrize("value", [
@@ -936,33 +937,33 @@ def test_parse_remote_arg(value, expected):
 ])
 def test_parse_remote_arg_rejects_bad_hosts(value):
     with pytest.raises(SystemExit):
-        snap.parse_remote_arg(value)
+        molt.parse_remote_arg(value)
 
 
 @pytest.mark.parametrize("root, expected_host, expected_root", [
-    ("user@host", "user@host", ".snap"),
-    ("host:", "host", ".snap"),
+    ("user@host", "user@host", ".molt"),
+    ("host:", "host", ".molt"),
     ("host:~", "host", "."),
-    ("host:~/snap", "host", "snap"),
-    ("host:/srv/snap", "host", "/srv/snap"),
+    ("host:~/molt", "host", "molt"),
+    ("host:/srv/molt", "host", "/srv/molt"),
 ])
-def test_main_remote_snap_root(monkeypatch, root, expected_host, expected_root):
-    # B6: a remote snap root is kept as (host, path), and args.root is a local copy of its
+def test_main_remote_molt_root(monkeypatch, root, expected_host, expected_root):
+    # B6: a remote molt root is kept as (host, path), and args.root is a local copy of its
     # configs and scripts that main() removes at exit
     seen, fetched = [], []
-    monkeypatch.setattr(snap, "__dry_run__", False)
-    monkeypatch.setattr(snap, "__verbose__", False)
-    monkeypatch.setattr(snap, "root_fetch", lambda *a: fetched.append(a))
-    monkeypatch.setattr(snap, "cmd_capture", lambda args: seen.append(
+    monkeypatch.setattr(molt, "__dry_run__", False)
+    monkeypatch.setattr(molt, "__verbose__", False)
+    monkeypatch.setattr(molt, "root_fetch", lambda *a: fetched.append(a))
+    monkeypatch.setattr(molt, "cmd_capture", lambda args: seen.append(
         (args.root_host, str(args.root_path), args.root, args.root.is_dir())
     ))
-    monkeypatch.setattr(snap.sys, "argv", ["snap", "capture", "-r", root, "--dry-run"])
+    monkeypatch.setattr(molt.sys, "argv", ["molt", "capture", "-r", root, "--dry-run"])
 
-    snap.main()
+    molt.main()
 
     [(host, path, local_copy, existed)] = seen
     assert (host, path) == (expected_host, expected_root)
-    assert fetched == [(expected_host, snap.PurePosixPath(expected_root), local_copy)]
+    assert fetched == [(expected_host, molt.PurePosixPath(expected_root), local_copy)]
     assert existed and not local_copy.exists()
 
 
@@ -971,13 +972,13 @@ def test_restore_to_user_at_host_deploys_remotely(tmp_path, monkeypatch):
     capture_dir.mkdir()
     (capture_dir / "snapshot.toml").write_text("")
     calls = []
-    monkeypatch.setattr(snap, "remote_deploy", lambda *a, **k: calls.append("remote"))
-    monkeypatch.setattr(snap, "restore", lambda *a, **k: calls.append("local"))
+    monkeypatch.setattr(molt, "remote_deploy", lambda *a, **k: calls.append("remote"))
+    monkeypatch.setattr(molt, "restore", lambda *a, **k: calls.append("local"))
 
     args = argparse.Namespace(
         root=tmp_path, root_host=None, src=str(capture_dir), dst="user@target.host"
     )
-    snap.cmd_restore(args)
+    molt.cmd_restore(args)
 
     assert calls == ["remote"]
 
@@ -1012,13 +1013,13 @@ def test_e2e_restore_to_non_host_is_rejected(env):
 # --- Output: display code never crashes, and each failure prints once --- #
 
 
-NO_SUCH_USER_ROOT = "~snap-test-no-such-user/root"
+NO_SUCH_USER_ROOT = "~molt-test-no-such-user/root"
 
 
 def unexpandable_root():
     """Return a root that expand_path() cannot expand (an unknown user's home)."""
     try:
-        snap.expand_path(NO_SUCH_USER_ROOT)
+        molt.expand_path(NO_SUCH_USER_ROOT)
     except RuntimeError:
         return NO_SUCH_USER_ROOT
     pytest.skip("the test user name exists on this machine")
@@ -1029,7 +1030,7 @@ def test_create_archives_failure_shows_unexpandable_root(tmp_path, capsys):
     outdir = tmp_path / "out"
     outdir.mkdir()
 
-    assert snap.create_archives([("cat", root, [".zshrc"], outdir)]) == []
+    assert molt.create_archives([("cat", root, [".zshrc"], outdir)]) == []
 
     captured = capsys.readouterr()
     assert "Error: Cannot create cat.tar.gz: " in captured.err
@@ -1041,10 +1042,10 @@ def test_archive_confirm_shows_unexpandable_root(tmp_path, monkeypatch, capsys):
     root = unexpandable_root()
     write_files(tmp_path / "src", {".zshrc": "x"})
     archive = make_archive(tmp_path, "cat", tmp_path / "src", [".zshrc"])
-    monkeypatch.setattr(snap, "__dry_run__", True)
+    monkeypatch.setattr(molt, "__dry_run__", True)
 
     # The header shows the root as given; the extraction reports the real error
-    assert snap.extract_archives([archive], root_map={"cat": root}) == 0
+    assert molt.extract_archives([archive], root_map={"cat": root}) == 0
 
     captured = capsys.readouterr()
     assert f"cat.tar.gz (root: {root})" in captured.out
@@ -1058,10 +1059,10 @@ def test_archive_confirm_prompt_matches_the_targets(tmp_path, monkeypatch, capsy
     empty = make_archive(tmp_path, "empty", tmp_path / "src", [".missing"])
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setattr(snap, "__dry_run__", True)
+    monkeypatch.setattr(molt, "__dry_run__", True)
 
     # Every entry is new: no overwrite warning, and paths relative to the root
-    assert snap.archive_confirm(archive, root=str(home))
+    assert molt.archive_confirm(archive, root=str(home))
     out = capsys.readouterr().out
     assert "     add: .vimrc\n" in out
     assert "     add: .zshrc\n" in out
@@ -1070,14 +1071,14 @@ def test_archive_confirm_prompt_matches_the_targets(tmp_path, monkeypatch, capsy
 
     # One entry exists
     write_files(home, {".zshrc": "old"})
-    assert snap.archive_confirm(archive, root=str(home))
+    assert molt.archive_confirm(archive, root=str(home))
     out = capsys.readouterr().out
     assert "     replace: .zshrc\n" in out
     assert "     add: .vimrc\n" in out
     assert "Restore cat.tar.gz? Existing files will be overwritten [y/N]: " in out
 
     # No entries at all
-    assert snap.archive_confirm(empty, root=str(home))
+    assert molt.archive_confirm(empty, root=str(home))
     assert "Restore empty.tar.gz? It has no files [y/N]: " in capsys.readouterr().out
 
 
@@ -1085,12 +1086,12 @@ def test_rsync_parallel_reports_only_the_first_failed_copy(tmp_path, monkeypatch
     def failing_rsync(cmd, **kwargs):
         raise subprocess.CalledProcessError(23, cmd, output="", stderr=f"rsync: bad {cmd[-2]}\n")
 
-    monkeypatch.setattr(snap.subprocess, "run", failing_rsync)
-    monkeypatch.setattr(snap, "__dry_run__", False)
+    monkeypatch.setattr(molt.subprocess, "run", failing_rsync)
+    monkeypatch.setattr(molt, "__dry_run__", False)
     transfers = [(str(tmp_path / f"f{i}"), "host:/tmp/work/", f"f{i}") for i in range(4)]
 
     with pytest.raises(SystemExit) as exit_info:
-        snap.rsync_parallel(transfers)
+        molt.rsync_parallel(transfers)
 
     assert exit_info.value.code == 1
     err = capsys.readouterr().err
@@ -1099,7 +1100,7 @@ def test_rsync_parallel_reports_only_the_first_failed_copy(tmp_path, monkeypatch
 
     # The next group of copies reports its own failure again
     with pytest.raises(SystemExit):
-        snap.rsync_parallel(transfers[:1])
+        molt.rsync_parallel(transfers[:1])
     assert capsys.readouterr().err.count("Error: Copying f0 failed (rsync exit status 23)") == 1
 
 
@@ -1107,7 +1108,7 @@ def test_run_scripts_skips_the_step_when_every_script_is_missing(tmp_path, capsy
     (tmp_path / "scripts").mkdir()
     config = {"scripts": {"before": ["scripts/a.sh", "scripts/b.sh"]}}
 
-    snap.run_scripts(tmp_path, config, "before", working_dir=tmp_path)
+    molt.run_scripts(tmp_path, config, "before", working_dir=tmp_path)
 
     captured = capsys.readouterr()
     assert "Skipping before scripts (no scripts found)" in captured.out
@@ -1119,10 +1120,10 @@ def test_run_scripts_names_the_migration_phase(tmp_path, monkeypatch, capsys):
     (tmp_path / "scripts").mkdir()
     (tmp_path / "scripts" / "a.sh").write_text("true\n")
     config = {"scripts": {"before": ["scripts/a.sh"]}}
-    monkeypatch.setattr(snap, "__dry_run__", True)
+    monkeypatch.setattr(molt, "__dry_run__", True)
 
-    snap.run_scripts(tmp_path, config, "before", working_dir=tmp_path, phase="capture")
-    snap.run_scripts(tmp_path, config, "after", working_dir=tmp_path, phase="restore")
+    molt.run_scripts(tmp_path, config, "before", working_dir=tmp_path, phase="capture")
+    molt.run_scripts(tmp_path, config, "after", working_dir=tmp_path, phase="restore")
 
     out = capsys.readouterr().out
     assert "Running capture before scripts..." in out
@@ -1138,23 +1139,23 @@ def test_sudo_restore_exit_code_survives_a_broken_stderr(tmp_path, monkeypatch):
             # The child ran; now the parent's stderr is gone
             broken = io.StringIO()
             broken.close()
-            monkeypatch.setattr(snap.sys, "stderr", broken)
+            monkeypatch.setattr(molt.sys, "stderr", broken)
             return 3
 
-    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(molt.subprocess, "Popen", FakePopen)
 
     with pytest.raises(SystemExit) as exit_info:
-        snap.sudo_restore(argparse.Namespace(root_host=None), tmp_path, tmp_path, {}, {})
+        molt.sudo_restore(argparse.Namespace(root_host=None), tmp_path, tmp_path, {}, {})
 
     assert exit_info.value.code == 3
 
 
 def test_stdout_is_flushed_before_stderr_only_when_they_share(tmp_path, monkeypatch):
     with open(tmp_path / "out", "w") as out, open(tmp_path / "err", "w") as err:
-        monkeypatch.setattr(snap.sys, "stdout", out)
-        assert not snap.shares_stdout(err)
+        monkeypatch.setattr(molt.sys, "stdout", out)
+        assert not molt.shares_stdout(err)
         with open(tmp_path / "out", "a") as same:
-            assert snap.shares_stdout(same)
+            assert molt.shares_stdout(same)
 
 
 # --- Fix A1: failures exit non-zero --- #
@@ -1171,7 +1172,7 @@ def fake_remote_tools(env):
 
 
 def snapshot_dir(env):
-    """Return the one snapshot under the snap root's captures directory."""
+    """Return the one snapshot under the molt root's captures directory."""
     [snapshot] = env.root.glob("captures/*/*/*")
     return snapshot
 
@@ -1269,11 +1270,11 @@ def test_e2e_restore_without_backups_stops_on_an_unreadable_archive(env):
     # Replace the archive with junk that still matches its checksum
     snapshot = snapshot_dir(env)
     archive = snapshot / "system.tar.gz"
-    old_digest = snap.sha256_file_digest(archive)
+    old_digest = molt.sha256_file_digest(archive)
     archive.write_bytes(b"not a tar archive")
     toml_path = snapshot / "snapshot.toml"
     toml_path.write_text(
-        toml_path.read_text().replace(old_digest, snap.sha256_file_digest(archive))
+        toml_path.read_text().replace(old_digest, molt.sha256_file_digest(archive))
     )
 
     result = env.run("restore", "-r", str(env.root), answers="y\n")
@@ -1302,11 +1303,11 @@ def test_archive_confirm_tells_a_bad_archive_from_a_declined_one(tmp_path, monke
     bad.write_bytes(b"junk")
     monkeypatch.setattr("builtins.input", lambda prompt: "n")
 
-    assert snap.archive_confirm(bad, root=str(tmp_path)) is None
-    assert snap.archive_confirm(good, root=str(tmp_path)) is False
+    assert molt.archive_confirm(bad, root=str(tmp_path)) is None
+    assert molt.archive_confirm(good, root=str(tmp_path)) is False
 
     restored, failed = [], []
-    assert snap.extract_archives(
+    assert molt.extract_archives(
         [good, bad], root_map={"good": str(tmp_path), "bad": str(tmp_path)},
         restored=restored, failed=failed,
     ) == 0
@@ -1391,8 +1392,8 @@ def test_restore_category_backs_up_archives_sharing_a_root(tmp_path):
     second = make_archive(tmp_path, "second", src, ["b.txt"])
 
     rotated = set()
-    assert snap.restore_category(first, str(home), ".bak", rotated=rotated)
-    assert snap.restore_category(second, str(home), ".bak", rotated=rotated)
+    assert molt.restore_category(first, str(home), ".bak", rotated=rotated)
+    assert molt.restore_category(second, str(home), ".bak", rotated=rotated)
 
     # One rotation for the root; each archive has its own subdirectory
     [previous] = tmp_path.glob("home.bak_*")
@@ -1411,7 +1412,7 @@ def test_backup_subdirectories_get_the_ancestor_owner_as_root(tmp_path, monkeypa
     calls = record_chown(monkeypatch)
     home_owner = (home.stat().st_uid, home.stat().st_gid, True)
 
-    assert snap.restore_category(archive, str(home / ".local" / "share"), ".bak")
+    assert molt.restore_category(archive, str(home / ".local" / "share"), ".bak")
 
     assert calls[home / ".local/share.bak/local"] == home_owner
 
@@ -1449,8 +1450,8 @@ def test_archive_select_matches_only_available_archives(tmp_path):
     available = [tmp_path / "dotfiles.tar.gz", tmp_path / "ssh-keys.tar.gz"]
     (tmp_path / "unlisted.tar.gz").write_bytes(b"")
 
-    assert snap.archive_select(available, []) == (available, [])
-    assert snap.archive_select(available, ["unlisted", "ssh*", "dotfiles", "ssh-keys"]) == (
+    assert molt.archive_select(available, []) == (available, [])
+    assert molt.archive_select(available, ["unlisted", "ssh*", "dotfiles", "ssh-keys"]) == (
         [available[1], available[0]],
         ["unlisted"],
     )
@@ -1463,13 +1464,13 @@ def test_snapshot_archives_lists_existing_tables_only(tmp_path):
         (snapshot / rel).write_bytes(b"")
     config = {"tar": {"dotfiles": {}, "missing": {}, "sub/x": {}, "../outside": {}}}
 
-    assert snap.snapshot_archives(snapshot, config, ".tar.gz") == [snapshot / "dotfiles.tar.gz"]
+    assert molt.snapshot_archives(snapshot, config, ".tar.gz") == [snapshot / "dotfiles.tar.gz"]
 
 
 def test_archive_category_strips_only_the_tar_extension():
-    assert snap.archive_category(Path("dotfiles.tar.gz")) == "dotfiles"
-    assert snap.archive_category(Path("my.tar.files.tar.xz")) == "my.tar.files"
-    assert snap.archive_category(Path("plain.tar")) == "plain"
+    assert molt.archive_category(Path("dotfiles.tar.gz")) == "dotfiles"
+    assert molt.archive_category(Path("my.tar.files.tar.xz")) == "my.tar.files"
+    assert molt.archive_category(Path("plain.tar")) == "plain"
 
 
 @pytest.mark.parametrize("archives", ['["*"]', '["evil", "dotfiles"]'])
@@ -1524,14 +1525,14 @@ def test_e2e_capture_uses_the_config_given_with_t(env):
 def test_capture_after_scripts_use_the_capture_config(tmp_path, monkeypatch):
     # A migration's capture config comes from migrate.toml's [capture.*] tables, not a file
     ran = []
-    monkeypatch.setattr(snap, "__dry_run__", True)
-    monkeypatch.setattr(snap, "run_scripts", lambda root, config, when, **kw: ran.append(
+    monkeypatch.setattr(molt, "__dry_run__", True)
+    monkeypatch.setattr(molt, "run_scripts", lambda root, config, when, **kw: ran.append(
         (when, config.get("scripts"))
     ))
     config = {"tar": {}, "scripts": {"after": ["scripts/dump.sh"]}}
     args = argparse.Namespace(run_scripts=True, config_toml="configs/migrate.toml")
 
-    snap.capture(args, tmp_path, tmp_path / "out", config)
+    molt.capture(args, tmp_path, tmp_path / "out", config)
 
     assert ran == [("before", config["scripts"]), ("after", config["scripts"])]
 
@@ -1550,14 +1551,14 @@ def test_toml_dumps_writes_nested_tables():
         "scripts": {"after": ["scripts/a.sh"], "count": 2, "on": True},
     }
 
-    text = snap.toml_dumps(config)
+    text = molt.toml_dumps(config)
 
     assert '[tar."ssh-keys"]\n' in text
     assert '[tar."dot.files"]\n' in text
     assert "[tar.empty]\n" in text
     assert "\n[tar]\n" not in text  # a table holding only tables needs no header
-    assert snap.tomllib.loads(text) == config
-    assert snap.toml_dumps({}) == ""
+    assert molt.tomllib.loads(text) == config
+    assert molt.toml_dumps({}) == ""
 
 
 def old_snapshot_toml(compress, roll_ext, tables):
@@ -1580,26 +1581,26 @@ def old_snapshot_toml(compress, roll_ext, tables):
 def test_snapshot_toml_reads_like_the_old_format(tmp_path, compress, roll_ext):
     src = tmp_path / "src"
     write_files(src, {".zshrc": "z", ".ssh/id": "k"})
-    ext, _ = snap.COMPRESS_MAP[compress]
+    ext, _ = molt.COMPRESS_MAP[compress]
     outdir = tmp_path / "out"
     outdir.mkdir()
     for name, paths in (("dotfiles", [".zshrc"]), ("ssh-keys", [".ssh"])):
-        snap.archive_create(name, str(src), paths, outdir, compress)
+        molt.archive_create(name, str(src), paths, outdir, compress)
     meta = {"dotfiles": {"root": "$HOME", "link": None},
             "ssh-keys": {"root": str(src), "link": "$HOME/keys"}}
 
-    toml_path, checksum = snap.generate_snapshot_toml(outdir, compress, meta, roll_ext)
+    toml_path, checksum = molt.generate_snapshot_toml(outdir, compress, meta, roll_ext)
 
-    digests = {name: snap.sha256_file_digest(outdir / f"{name}{ext}")
+    digests = {name: molt.sha256_file_digest(outdir / f"{name}{ext}")
                for name in ("dotfiles", "ssh-keys")}
     old = old_snapshot_toml(compress, roll_ext, {
         "dotfiles": ("$HOME", None, digests["dotfiles"]),
         "ssh-keys": (str(src), "$HOME/keys", digests["ssh-keys"]),
     })
     with open(toml_path, "rb") as f:
-        assert snap.tomllib.load(f) == snap.tomllib.loads(old)
+        assert molt.tomllib.load(f) == molt.tomllib.loads(old)
     # The snapshot id is still the digest of the archive digests, in name order
-    assert checksum == snap.sha256_digest(
+    assert checksum == molt.sha256_digest(
         (digests["dotfiles"] + digests["ssh-keys"]).encode("utf-8")
     )
 
@@ -1611,10 +1612,10 @@ def test_write_capture_toml_keeps_every_value(tmp_path):
         "scripts": {"after": ["scripts/dump.sh"]},
     }
 
-    path = snap.write_capture_toml(config)
+    path = molt.write_capture_toml(config)
     try:
         with open(path, "rb") as f:
-            assert snap.tomllib.load(f) == config
+            assert molt.tomllib.load(f) == config
     finally:
         path.unlink()
 
@@ -1623,13 +1624,13 @@ def test_write_capture_toml_keeps_every_value(tmp_path):
 
 
 def test_dtqdm_without_tqdm_is_a_no_op_bar(monkeypatch, capsys):
-    monkeypatch.setattr(snap, "tqdm", None)
-    monkeypatch.setattr(snap, "__dry_run__", False)
+    monkeypatch.setattr(molt, "tqdm", None)
+    monkeypatch.setattr(molt, "__dry_run__", False)
 
-    with snap.dtqdm(2, "Creating archives", autorefresh=True) as pbar:
+    with molt.dtqdm(2, "Creating archives", autorefresh=True) as pbar:
         pbar.update(1)
         pbar.write("hello")
-    snap.say("after the bar")
+    molt.say("after the bar")
 
     assert capsys.readouterr().out == "hello\n  after the bar\n"
 
@@ -1653,10 +1654,10 @@ def test_e2e_capture_and_sudo_restore_run_without_tqdm(env):
     (site / "sitecustomize.py").write_text(SITECUSTOMIZE)
     env.sudo.write_text(
         '#!/bin/sh\necho "$@" > "$SUDO_MARKER"\n'
-        "export SNAP_TEST_FAKE_ROOT=1\nunset SNAP_TEST_FORCE_SUDO\nexec \"$@\"\n"
+        "export MOLT_TEST_FAKE_ROOT=1\nunset MOLT_TEST_FORCE_SUDO\nexec \"$@\"\n"
     )
     result = env.run("restore", "-r", str(env.root), extra_env={
-        "SNAP_TEST_FORCE_SUDO": "1",
+        "MOLT_TEST_FORCE_SUDO": "1",
         "PYTHONPATH": f"{site}{os.pathsep}{no_tqdm}",
     })
 
@@ -1676,11 +1677,11 @@ def test_rsync_run_verbose_adds_no_progress_option(tmp_path, monkeypatch):
         commands.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(snap.subprocess, "run", fake_run)
-    monkeypatch.setattr(snap, "__dry_run__", False)
-    monkeypatch.setattr(snap, "__verbose__", True)
+    monkeypatch.setattr(molt.subprocess, "run", fake_run)
+    monkeypatch.setattr(molt, "__dry_run__", False)
+    monkeypatch.setattr(molt, "__verbose__", True)
 
-    snap.rsync_run(str(tmp_path / "f"), "host:/tmp/work/")
+    molt.rsync_run(str(tmp_path / "f"), "host:/tmp/work/")
 
     [cmd] = commands
     assert cmd[:2] == ["rsync", "-az"]
@@ -1768,7 +1769,7 @@ if __name__ == "__main__":
     sys.exit(ssh(args) if tool == "ssh" else rsync(args))
 '''
 
-# A host's sudo: logs the call, then runs the command as this user, which snap.py takes
+# A host's sudo: logs the call, then runs the command as this user, which molt.py takes
 # for root (SITECUSTOMIZE). A nested sudo fails, so a restore can never loop
 FAKE_HOST_SUDO = """\
 echo "sudo $FAKE_HOST $*" >> "$FAKE_HOSTS/calls.log"
@@ -1776,7 +1777,7 @@ if [ -n "$FAKE_SUDO_ACTIVE" ]; then
     echo "fake sudo: nested sudo" >&2
     exit 1
 fi
-export FAKE_SUDO_ACTIVE=1 SNAP_TEST_FAKE_ROOT=1
+export FAKE_SUDO_ACTIVE=1 MOLT_TEST_FAKE_ROOT=1
 export PYTHONPATH="$FAKE_HOSTS/site${PYTHONPATH:+:$PYTHONPATH}"
 exec "$@"
 """
@@ -1858,9 +1859,9 @@ def hosts(env):
     )
 
 
-def remote_snap_root(hosts, host, categories, restore_toml='[tar]\narchives = ["*"]\n'):
-    """Give an emulated host a .snap in its home with capture.toml and restore.toml."""
-    root = hosts.home(host) / ".snap"
+def remote_molt_root(hosts, host, categories, restore_toml='[tar]\narchives = ["*"]\n'):
+    """Give an emulated host a .molt in its home with capture.toml and restore.toml."""
+    root = hosts.home(host) / ".molt"
     (root / "configs").mkdir(parents=True)
     write_configs(root, categories)
     (root / "configs" / "restore.toml").write_text(restore_toml)
@@ -1869,7 +1870,7 @@ def remote_snap_root(hosts, host, categories, restore_toml='[tar]\narchives = ["
 
 def work_dir_of(commands, purpose):
     """Return the work directory the 'mkdir -p' after mktemp created, from ssh commands."""
-    [mkdir] = [c for c in commands if c.startswith("mkdir -p ") and f"/snap-{purpose}." in c]
+    [mkdir] = [c for c in commands if c.startswith("mkdir -p ") and f"/molt-{purpose}." in c]
     first = shlex.split(mkdir)[2]
     return first.rsplit("/", 1)[0]
 
@@ -1882,20 +1883,20 @@ def work_dir_of(commands, purpose):
     ("~/", "."),
     ("~/snaps", "snaps"),
     ("~/snaps/2026/", "snaps/2026"),
-    (".snap/captures", ".snap/captures"),
-    ("/srv/snap", "/srv/snap"),
+    (".molt/captures", ".molt/captures"),
+    ("/srv/molt", "/srv/molt"),
     ("~other/x", "~other/x"),
-    (Path("~/snap"), "snap"),
+    (Path("~/molt"), "molt"),
 ])
 def test_normalize_remote_path(path, expected):
-    assert str(snap.normalize_remote_path(path)) == expected
+    assert str(molt.normalize_remote_path(path)) == expected
 
 
-def test_remote_snap_root_is_the_r_path_only_on_its_host():
-    args = argparse.Namespace(root_host="user@web-01", root_path=snap.PurePosixPath("/srv/x"))
-    assert str(snap.remote_snap_root(args, "user@web-01")) == "/srv/x"
-    assert str(snap.remote_snap_root(args, "user@web-02")) == ".snap"
-    assert str(snap.remote_snap_root(argparse.Namespace(), "web-01")) == ".snap"
+def test_remote_molt_root_is_the_r_path_only_on_its_host():
+    args = argparse.Namespace(root_host="user@web-01", root_path=molt.PurePosixPath("/srv/x"))
+    assert str(molt.remote_molt_root(args, "user@web-01")) == "/srv/x"
+    assert str(molt.remote_molt_root(args, "user@web-02")) == ".molt"
+    assert str(molt.remote_molt_root(argparse.Namespace(), "web-01")) == ".molt"
 
 
 def test_e2e_remote_paths_are_relative_to_the_login_directory(env, hosts):
@@ -1911,10 +1912,10 @@ def test_e2e_remote_paths_are_relative_to_the_login_directory(env, hosts):
     assert "  To:   user@web-01:snaps\n" in result.stdout
     assert f"Snapshot saved to user@web-01:snaps/{snapshot.name}\n" in result.stdout
 
-    # A host with no path gets .snap/captures/YYYY/MM-DD there, never the local root
+    # A host with no path gets .molt/captures/YYYY/MM-DD there, never the local root
     result = env.run("capture", "-r", str(env.root), "--to", "user@web-01")
     assert result.returncode == 0, result.stdout + result.stderr
-    [default] = remote.glob(".snap/captures/*/*/*")
+    [default] = remote.glob(".molt/captures/*/*/*")
     assert (default / "snapshot.toml").is_file()
     assert f"To:   user@web-01:{default.parent.relative_to(remote)}\n" in result.stdout
 
@@ -1949,36 +1950,37 @@ def fake_ssh_runs(monkeypatch, outputs=None):
             if text in command:
                 stdout = output
         if command.startswith("mktemp -d"):
-            purpose = re.search(r"snap-(\w+)\.X", command).group(1)
-            stdout = stdout or f"/tmp/snap-{purpose}.Ab3dEf9h\n"
+            purpose = re.search(r"molt-(\w+)\.X", command).group(1)
+            stdout = stdout or f"/tmp/molt-{purpose}.Ab3dEf9h\n"
         return subprocess.CompletedProcess(cmd, 0, stdout, "")
 
-    monkeypatch.setattr(snap.subprocess, "run", run)
-    monkeypatch.setattr(snap, "__dry_run__", False)
-    monkeypatch.setattr(snap, "__verbose__", False)
+    monkeypatch.setattr(molt.subprocess, "run", run)
+    monkeypatch.setattr(molt, "__dry_run__", False)
+    monkeypatch.setattr(molt, "__verbose__", False)
     return calls
 
 
 def test_remote_workdir_uses_mktemp_and_one_mkdir(monkeypatch, capsys):
     calls = fake_ssh_runs(monkeypatch)
 
-    work_dir = snap.remote_workdir("user@web-01", "restore", ["configs", "scripts", "snapshot"])
+    work_dir = molt.remote_workdir("user@web-01", "restore", ["configs", "scripts", "snapshot"])
 
-    assert str(work_dir) == "/tmp/snap-restore.Ab3dEf9h"
+    assert str(work_dir) == "/tmp/molt-restore.Ab3dEf9h"
     assert [cmd[-2:] for cmd, _ in calls] == [
-        ["user@web-01", 'mktemp -d "${TMPDIR:-/tmp}/snap-restore.XXXXXXXX"'],
-        ["user@web-01", "mkdir -p /tmp/snap-restore.Ab3dEf9h/configs "
-                        "/tmp/snap-restore.Ab3dEf9h/scripts /tmp/snap-restore.Ab3dEf9h/snapshot"],
+        ["user@web-01", 'mktemp -d "${TMPDIR:-/tmp}/molt-restore.XXXXXXXX"'],
+        ["user@web-01", "mkdir -p /tmp/molt-restore.Ab3dEf9h/configs "
+                        "/tmp/molt-restore.Ab3dEf9h/scripts "
+                        "/tmp/molt-restore.Ab3dEf9h/snapshot"],
     ]
     assert capsys.readouterr().out == "\nCreating work directory on user@web-01...\n"
 
 
-@pytest.mark.parametrize("output", ["", "/tmp/other-dir\n", "snap-restore.x\n"])
+@pytest.mark.parametrize("output", ["", "/tmp/other-dir\n", "molt-restore.x\n"])
 def test_remote_workdir_never_uses_an_odd_mktemp_path(monkeypatch, capsys, output):
     calls = fake_ssh_runs(monkeypatch, {"mktemp": output or "\n"})
 
     with pytest.raises(SystemExit):
-        snap.remote_workdir("user@web-01", "restore", ["configs"])
+        molt.remote_workdir("user@web-01", "restore", ["configs"])
 
     # Nothing but mktemp ran: no mkdir, and no rm -rf of a path mktemp didn't make
     assert [cmd[-1].split()[0] for cmd, _ in calls] == ["mktemp"]
@@ -1987,7 +1989,7 @@ def test_remote_workdir_never_uses_an_odd_mktemp_path(monkeypatch, capsys, outpu
 
 def test_remote_workdir_is_removed_when_its_layout_fails(monkeypatch):
     calls = fake_ssh_runs(monkeypatch)
-    real_run = snap.subprocess.run
+    real_run = molt.subprocess.run
 
     def run(cmd, **kwargs):
         if cmd[-1].startswith("mkdir"):
@@ -1995,11 +1997,11 @@ def test_remote_workdir_is_removed_when_its_layout_fails(monkeypatch):
             raise subprocess.CalledProcessError(1, cmd, "", "mkdir: No space left\n")
         return real_run(cmd, **kwargs)
 
-    monkeypatch.setattr(snap.subprocess, "run", run)
+    monkeypatch.setattr(molt.subprocess, "run", run)
 
     with pytest.raises(SystemExit):
-        snap.remote_workdir("user@web-01", "capture", ["configs"])
-    assert calls[-1][0][-1] == "rm -rf /tmp/snap-capture.Ab3dEf9h"
+        molt.remote_workdir("user@web-01", "capture", ["configs"])
+    assert calls[-1][0][-1] == "rm -rf /tmp/molt-capture.Ab3dEf9h"
 
 
 def test_remote_capture_removes_its_work_dir_on_ctrl_c(tmp_path, monkeypatch, capsys):
@@ -2010,25 +2012,25 @@ def test_remote_capture_removes_its_work_dir_on_ctrl_c(tmp_path, monkeypatch, ca
     def interrupted(transfers):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(snap, "rsync_parallel", interrupted)
+    monkeypatch.setattr(molt, "rsync_parallel", interrupted)
     args = argparse.Namespace(config_toml=None, run_scripts=False)
 
     with pytest.raises(KeyboardInterrupt):
-        snap.remote_capture(args, tmp_path, "user@web-01")
+        molt.remote_capture(args, tmp_path, "user@web-01")
 
-    # snap.py still running there is stopped first, so it can't recreate files
+    # molt.py still running there is stopped first, so it can't recreate files
     assert calls[-1][0][-1] == (
-        "pkill -INT -f 'snap[.]py capture -r /tmp/snap-capture\\.Ab3dEf9h( |$)' && sleep 2; "
-        "rm -rf /tmp/snap-capture.Ab3dEf9h"
+        "pkill -INT -f 'molt[.]py capture -r /tmp/molt-capture\\.Ab3dEf9h( |$)' && sleep 2; "
+        "rm -rf /tmp/molt-capture.Ab3dEf9h"
     )
     # The cleanup after a failure prints nothing of its own
     assert "Removing work directory" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("command, purpose, fail", [
-    (["capture", "--from", "user@web-01"], "capture", "snap.py capture"),
-    (["restore", "--to", "user@web-01"], "restore", "snap.py restore"),
-    (["migrate", "--to", "user@web-01"], "restore", "snap.py restore"),
+    (["capture", "--from", "user@web-01"], "capture", "molt.py capture"),
+    (["restore", "--to", "user@web-01"], "restore", "molt.py restore"),
+    (["migrate", "--to", "user@web-01"], "restore", "molt.py restore"),
 ])
 def test_e2e_remote_work_dir_is_removed_when_the_remote_step_fails(
     env, hosts, command, purpose, fail
@@ -2058,11 +2060,11 @@ def test_e2e_remote_work_dir_is_removed_when_the_remote_step_fails(
 
     # mktemp made a private work dir on the host; it is gone, and so are local temp dirs
     commands = hosts.ssh_commands("user@web-01")
-    assert commands[0] == f'mktemp -d "${{TMPDIR:-/tmp}}/snap-{purpose}.XXXXXXXX"'
+    assert commands[0] == f'mktemp -d "${{TMPDIR:-/tmp}}/molt-{purpose}.XXXXXXXX"'
     work_dir = work_dir_of(commands, purpose)
     assert Path(work_dir).parent == hosts.tmp("web-01")
     if purpose == "capture":
-        stop = snap.remote_stop_command(work_dir, "capture")
+        stop = molt.remote_stop_command(work_dir, "capture")
         assert commands[-1] == f"{stop}; rm -rf {work_dir}"
     else:
         assert commands[-1] == f"rm -rf {work_dir}"
@@ -2083,7 +2085,7 @@ def test_e2e_latest_remote_snapshot_has_the_newest_snapshot_toml(env, hosts):
         [snapshots[content]] = (env.tmp / content).iterdir()
 
     # The newer snapshot sits in the older-looking date dir; stray entries are newer still
-    captures = hosts.home("web-01") / ".snap" / "captures"
+    captures = hosts.home("web-01") / ".molt" / "captures"
     newer = captures / "2025" / "01-01" / snapshots["newer"].name
     older = captures / "2026" / "12-31" / snapshots["older"].name
     shutil.copytree(snapshots["newer"], newer)
@@ -2094,7 +2096,7 @@ def test_e2e_latest_remote_snapshot_has_the_newest_snapshot_toml(env, hosts):
         "2026/1231/abc1234/snapshot.toml": "not a date dir",
         "2026/12-31/snapshot.toml": "not in a snapshot dir",
     })
-    now = snap.datetime.now().timestamp()
+    now = molt.datetime.now().timestamp()
     os.utime(older / "snapshot.toml", (now - 3600, now - 3600))
     os.utime(newer / "snapshot.toml", (now - 60, now - 60))
     write_files(env.home, {".zshrc": "edited"})
@@ -2103,30 +2105,30 @@ def test_e2e_latest_remote_snapshot_has_the_newest_snapshot_toml(env, hosts):
     result = env.run("restore", "-r", str(env.root), "--from", "user@web-01", "--dry-run")
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"latest: 2025/01-01/{newer.name}\n" in result.stdout
-    assert f"user@web-01:.snap/captures/2025/01-01/{newer.name}/" in result.stdout
+    assert f"user@web-01:.molt/captures/2025/01-01/{newer.name}/" in result.stdout
     assert (env.home / ".zshrc").read_text() == "edited"
 
     result = env.run("restore", "-r", str(env.root), "--from", "user@web-01")
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "  From: user@web-01:.snap/captures (latest)\n" in result.stdout
+    assert "  From: user@web-01:.molt/captures (latest)\n" in result.stdout
     assert f"latest: 2025/01-01/{newer.name}\n" in result.stdout
     assert (env.home / ".zshrc").read_text() == "newer"
 
     # The listing is one portable ls -t under sh
     [listing] = set(hosts.ssh_commands("user@web-01"))
     assert listing == (
-        "sh -c 'ls -1t -- .snap/captures/[0-9][0-9][0-9][0-9]/[0-9][0-9]-[0-9][0-9]/*/"
+        "sh -c 'ls -1t -- .molt/captures/[0-9][0-9][0-9][0-9]/[0-9][0-9]-[0-9][0-9]/*/"
         "snapshot.toml 2>/dev/null | head -1'"
     )
 
 
 def test_e2e_remote_without_snapshots(env, hosts):
     write_configs(env.root, {"dotfiles": ("$HOME", [".zshrc"])})
-    write_files(hosts.home("web-01") / ".snap" / "captures" / "2026", {"README": "x"})
+    write_files(hosts.home("web-01") / ".molt" / "captures" / "2026", {"README": "x"})
 
     result = env.run("restore", "-r", str(env.root), "--from", "user@web-01")
     assert result.returncode == 1
-    assert result.stderr.endswith("Error: No snapshots found in user@web-01:.snap/captures\n")
+    assert result.stderr.endswith("Error: No snapshots found in user@web-01:.molt/captures\n")
 
     result = env.run(
         "restore", "-r", str(env.root), "--from", "user@web-01",
@@ -2142,9 +2144,9 @@ def test_e2e_remote_without_snapshots(env, hosts):
 # --- Fix B6: -r host[:path] reads configs and scripts from the host --- #
 
 
-def test_e2e_capture_and_restore_with_a_remote_snap_root(env, hosts):
+def test_e2e_capture_and_restore_with_a_remote_molt_root(env, hosts):
     write_files(env.home, {".zshrc": "v1", ".vimrc": "v1"})
-    remote_root = remote_snap_root(
+    remote_root = remote_molt_root(
         hosts, "web-01", {"dotfiles": ("$HOME", [".zshrc"]), "vim": ("$HOME", [".vimrc"])},
         restore_toml='[tar]\narchives = ["dotfiles"]\n',
     )
@@ -2157,7 +2159,7 @@ def test_e2e_capture_and_restore_with_a_remote_snap_root(env, hosts):
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"  dotfiles.tar.gz (root: {env.home})\n" in result.stdout
     assert f"  vim.tar.gz (root: {env.home})\n" in result.stdout
-    assert "Note: A real run would copy the snapshot to user@web-01:.snap/captures/" in (
+    assert "Note: A real run would copy the snapshot to user@web-01:.molt/captures/" in (
         result.stdout
     )
     assert not (remote_root / "captures").exists()
@@ -2172,14 +2174,14 @@ def test_e2e_capture_and_restore_with_a_remote_snap_root(env, hosts):
     rel = snapshot.relative_to(hosts.home("web-01"))
     assert f"  To:   user@web-01:{rel.parent}\n" in result.stdout
     assert f"✓ Snapshot saved to user@web-01:{rel}\n" in result.stdout
-    assert list(tmpdir.iterdir()) == []  # the local copy of the snap root is gone
+    assert list(tmpdir.iterdir()) == []  # the local copy of the molt root is gone
 
     # restore takes the host's latest snapshot and its restore.toml ('dotfiles' only)
     write_files(env.home, {".zshrc": "edited", ".vimrc": "edited"})
     hosts.clear()
     result = env.run("restore", "-r", "user@web-01", extra_env=local_tmp)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "  From: user@web-01:.snap/captures (latest)\n" in result.stdout
+    assert "  From: user@web-01:.molt/captures (latest)\n" in result.stdout
     assert f"latest: {snapshot.relative_to(remote_root / 'captures')}\n" in result.stdout
     assert "Warning" not in result.stderr
     assert (env.home / ".zshrc").read_text() == "v1"
@@ -2187,38 +2189,39 @@ def test_e2e_capture_and_restore_with_a_remote_snap_root(env, hosts):
     assert list(tmpdir.iterdir()) == []
     assert snapshot.is_dir()  # the host keeps its snapshot
 
-    # Only reads reached the host: the snap root copy, the listing and the pull
+    # Only reads reached the host: the molt root copy, the listing and the pull
     for line in hosts.calls():
         assert line.startswith(("rsync ", "ssh user@web-01 sh -c 'ls -1t ")), line
-    assert not (env.home / ".snap").exists()
+    assert not (env.home / ".molt").exists()
 
 
-def test_e2e_remote_snap_root_errors_name_the_host(env, hosts):
+def test_e2e_remote_molt_root_errors_name_the_host(env, hosts):
     tmpdir = env.tmp / "tmpdir"
     tmpdir.mkdir()
 
-    # No .snap on the host: stops before the banner, like a missing local .snap
+    # No .molt on the host: stops before the banner, like a missing local .molt
     result = env.run("capture", "-r", "user@web-01", extra_env={"TMPDIR": str(tmpdir)})
     assert result.returncode == 1
     assert "Starting capture" not in result.stdout
     assert (
-        "Error: Copying the snap root from user@web-01 failed (rsync exit status 23)\n"
-        "  from: user@web-01:.snap/\n"
-        "  Create a .snap directory on user@web-01, or pass -r/--snap-root user@web-01:<path>\n"
+        "Error: Copying the molt root from user@web-01 failed (rsync exit status 23)\n"
+        "  from: user@web-01:.molt/\n"
+        "  Create a .molt directory on user@web-01, or pass -r/--molt-root "
+        "user@web-01:<path> (an older install's is .snap)\n"
     ) in result.stderr
     assert list(tmpdir.iterdir()) == []
 
     # A missing config is named by where it lives
-    (hosts.home("web-01") / "snap" / "scripts").mkdir(parents=True)
-    result = env.run("capture", "-r", "user@web-01:~/snap", "--dry-run")
+    (hosts.home("web-01") / "molt" / "scripts").mkdir(parents=True)
+    result = env.run("capture", "-r", "user@web-01:~/molt", "--dry-run")
     assert result.returncode == 1
-    assert "Error: Config file not found: user@web-01:snap/configs/capture.toml\n" in (
+    assert "Error: Config file not found: user@web-01:molt/configs/capture.toml\n" in (
         result.stderr
     )
 
 
-def test_e2e_remote_snap_root_scripts_run_from_the_local_copy(env, hosts):
-    remote_root = remote_snap_root(hosts, "web-01", {"dotfiles": ("$HOME", [".zshrc"])})
+def test_e2e_remote_molt_root_scripts_run_from_the_local_copy(env, hosts):
+    remote_root = remote_molt_root(hosts, "web-01", {"dotfiles": ("$HOME", [".zshrc"])})
     write_files(env.home, {".zshrc": "v1"})
     write_files(remote_root, {"scripts/after.sh": 'echo "after in $PWD"\n'})
     capture_toml = remote_root / "configs" / "capture.toml"
@@ -2232,7 +2235,7 @@ def test_e2e_remote_snap_root_scripts_run_from_the_local_copy(env, hosts):
     assert "    after in " in result.stdout
 
 
-def test_sudo_restore_passes_the_local_copy_of_a_remote_snap_root(tmp_path, monkeypatch):
+def test_sudo_restore_passes_the_local_copy_of_a_remote_molt_root(tmp_path, monkeypatch):
     commands = []
 
     class FakePopen:
@@ -2242,11 +2245,11 @@ def test_sudo_restore_passes_the_local_copy_of_a_remote_snap_root(tmp_path, monk
         def wait(self):
             return 0
 
-    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
-    args = argparse.Namespace(root_host="user@web-01", root_path=snap.PurePosixPath(".snap"))
+    monkeypatch.setattr(molt.subprocess, "Popen", FakePopen)
+    args = argparse.Namespace(root_host="user@web-01", root_path=molt.PurePosixPath(".molt"))
 
     with pytest.raises(SystemExit):
-        snap.sudo_restore(args, tmp_path / "copy", tmp_path / "cap", {}, {})
+        molt.sudo_restore(args, tmp_path / "copy", tmp_path / "cap", {}, {})
 
     [cmd] = commands
     assert cmd[cmd.index("-r") + 1] == str(tmp_path / "copy")
@@ -2259,38 +2262,38 @@ def test_sudo_restore_passes_the_local_copy_of_a_remote_snap_root(tmp_path, monk
 def test_long_running_commands_have_no_wall_clock_timeout(tmp_path, monkeypatch):
     (tmp_path / "configs").mkdir()
     write_configs(tmp_path, {"dotfiles": ("$HOME", [".zshrc"])})
-    calls = fake_ssh_runs(monkeypatch, {"ls -d": "/tmp/snap-capture.Ab3dEf9h/out/abc1234/\n"})
+    calls = fake_ssh_runs(monkeypatch, {"ls -d": "/tmp/molt-capture.Ab3dEf9h/out/abc1234/\n"})
     args = argparse.Namespace(config_toml=None, run_scripts=False)
 
-    pulled, tmpdir = snap.remote_capture(args, tmp_path, "user@web-01")
+    pulled, tmpdir = molt.remote_capture(args, tmp_path, "user@web-01")
     assert pulled == tmpdir / "abc1234"
     shutil.rmtree(tmpdir)
 
     timeouts = {}
     for cmd, timeout in calls:
         name = cmd[0] if cmd[0] == "rsync" else cmd[-1].split()[0]
-        if cmd[0] == "ssh" and "snap.py capture" in cmd[-1]:
+        if cmd[0] == "ssh" and "molt.py capture" in cmd[-1]:
             name = "remote capture"
         timeouts.setdefault(name, set()).add(timeout)
     assert timeouts == {
-        "mktemp": {snap.COMMAND_TIMEOUT},
-        "mkdir": {snap.COMMAND_TIMEOUT},
+        "mktemp": {molt.COMMAND_TIMEOUT},
+        "mkdir": {molt.COMMAND_TIMEOUT},
         "rsync": {None},
         "remote capture": {None},
-        "ls": {snap.COMMAND_TIMEOUT},
-        "rm": {snap.COMMAND_TIMEOUT},
+        "ls": {molt.COMMAND_TIMEOUT},
+        "rm": {molt.COMMAND_TIMEOUT},
     }
     # rsync keeps its own inactivity limit
-    assert all(f"--timeout={snap.RSYNC_TIMEOUT}" in cmd for cmd, _ in calls if cmd[0] == "rsync")
+    assert all(f"--timeout={molt.RSYNC_TIMEOUT}" in cmd for cmd, _ in calls if cmd[0] == "rsync")
 
 
 def test_scripts_have_no_wall_clock_timeout(tmp_path, monkeypatch):
-    # B3: scripts on a host are run by snap.py there, which runs them like this
+    # B3: scripts on a host are run by molt.py there, which runs them like this
     write_files(tmp_path, {"scripts/a.sh": "true\n"})
     calls = fake_ssh_runs(monkeypatch)
     config = {"scripts": {"before": ["scripts/a.sh"]}}
 
-    snap.run_scripts(tmp_path, config, "before", working_dir=tmp_path)
+    molt.run_scripts(tmp_path, config, "before", working_dir=tmp_path)
 
     assert [timeout for _, timeout in calls] == [None]
 
@@ -2300,10 +2303,10 @@ def test_scripts_have_no_wall_clock_timeout(tmp_path, monkeypatch):
 
 def test_ssh_run_in_a_dry_run_returns_a_placeholder_result(monkeypatch, capsys):
     calls = fake_ssh_runs(monkeypatch, {"ls": "2026/09-23/abc1234/snapshot.toml\n"})
-    monkeypatch.setattr(snap, "__dry_run__", True)
+    monkeypatch.setattr(molt, "__dry_run__", True)
 
-    assert snap.ssh_run("user@web-01", "mkdir -p x") == (0, "", "")
-    listing = snap.ssh_run("user@web-01", "ls", read_only=True)
+    assert molt.ssh_run("user@web-01", "mkdir -p x") == (0, "", "")
+    listing = molt.ssh_run("user@web-01", "ls", read_only=True)
     assert listing == (0, "2026/09-23/abc1234/snapshot.toml\n", "")
 
     # Only the read-only query ran; only the skipped command is shown
@@ -2316,7 +2319,7 @@ def test_ssh_run_in_a_dry_run_returns_a_placeholder_result(monkeypatch, capsys):
 
 @pytest.mark.parametrize("command", [
     ["restore", "--to", "user@web-01", "--run-scripts"],
-    ["restore", "--from", "user@web-02:.snap/captures/2026/09-23/abc1234",
+    ["restore", "--from", "user@web-02:.molt/captures/2026/09-23/abc1234",
      "--to", "user@web-01", "--run-scripts"],
     ["capture", "--from", "user@web-01", "--run-scripts"],
     ["migrate", "--to", "user@web-01", "--run-scripts"],
@@ -2349,15 +2352,15 @@ def test_e2e_remote_dry_runs_change_nothing(env, hosts, command):
     assert not (env.home / "before-ran").exists()
 
 
-# --- Fix B3: snap.py runs on the host, with python3 from its PATH and no hard-coded sudo --- #
+# --- Fix B3: molt.py runs on the host, with python3 from its PATH and no hard-coded sudo --- #
 
 
 def child_command(work_dir, command, *options):
-    """Return the shell line snap.py sends a host to run 'snap.py <command>' there.
+    """Return the shell line molt.py sends a host to run 'molt.py <command>' there.
 
     A capture runs under umask 077, so what it writes stays private.
     """
-    argv = ["python3", "snap.py", command, *options]
+    argv = ["python3", "molt.py", command, *options]
     line = f"cd {shlex.quote(str(work_dir))} && {shlex.join(argv)}"
     if command == "capture":
         line = f"umask 077 && {line}"
@@ -2392,7 +2395,7 @@ BREW_SCRIPT = 'echo "brew from $(basename "$HOME")" > Brewfile\n'
 SEEN_SCRIPT = (
     'cp Brewfile "$HOME/Brewfile-seen"\n'
     'cp ../configs/restore.toml "$HOME/restore-config-seen" 2>/dev/null || true\n'
-    'echo "${SNAP_TEST_FAKE_ROOT:-user} in $PWD" > "$HOME/seen-by"\n'
+    'echo "${MOLT_TEST_FAKE_ROOT:-user} in $PWD" > "$HOME/seen-by"\n'
 )
 
 
@@ -2409,7 +2412,7 @@ def write_migrate_toml(root):
     write_files(root, {"scripts/sub/brew.sh": BREW_SCRIPT, "scripts/seen.sh": SEEN_SCRIPT})
 
 
-def test_e2e_capture_from_host_runs_snap_py_there(env, hosts):
+def test_e2e_capture_from_host_runs_molt_py_there(env, hosts):
     # The -t config is the one the host gets, with its script at the same relative path
     write_files(env.root, {"scripts/sub/brew.sh": BREW_SCRIPT})
     write_configs(env.root, {"vim": ("$HOME", [".vimrc"])})
@@ -2455,7 +2458,7 @@ def test_e2e_capture_from_host_runs_snap_py_there(env, hosts):
     assert list(tmpdir.iterdir()) == []
 
 
-def test_e2e_restore_to_host_runs_snap_py_there(env, hosts):
+def test_e2e_restore_to_host_runs_molt_py_there(env, hosts):
     write_files(env.home, {".zshrc": "v1"})
     write_files(env.root, {"scripts/sub/brew.sh": BREW_SCRIPT, "scripts/seen.sh": SEEN_SCRIPT})
     write_configs(
@@ -2480,7 +2483,7 @@ def test_e2e_restore_to_host_runs_snap_py_there(env, hosts):
     assert (remote / ".zshrc").read_text() == "v1"
     assert (remote.parent / "home.bak" / "dotfiles" / ".zshrc").read_text() == "old"
 
-    # snap.py there restores without sudo (nothing needs root) and runs the after script
+    # molt.py there restores without sudo (nothing needs root) and runs the after script
     # itself, in its snapshot copy, which holds the Brewfile written at capture
     commands = hosts.ssh_commands("user@web-01")
     work_dir = work_dir_of(commands, "restore")
@@ -2492,8 +2495,8 @@ def test_e2e_restore_to_host_runs_snap_py_there(env, hosts):
     assert not any(line.startswith("sudo ") for line in hosts.calls())
     assert (remote / "Brewfile-seen").read_text() == "brew from home\n"
     assert (remote / "seen-by").read_text() == f"user in {work_dir}/snapshot\n"
-    assert snap.tomllib.loads((remote / "restore-config-seen").read_text()) == (
-        snap.tomllib.loads((env.root / "configs" / "restore.toml").read_text())
+    assert molt.tomllib.loads((remote / "restore-config-seen").read_text()) == (
+        molt.tomllib.loads((env.root / "configs" / "restore.toml").read_text())
     )
     assert not (env.home / "seen-by").exists()
 
@@ -2509,7 +2512,7 @@ def test_e2e_restore_to_host_runs_snap_py_there(env, hosts):
 
 def test_e2e_restore_to_host_re_runs_with_sudo_there_only_when_needed(env, hosts):
     write_files(env.home, {"force-sudo-root/f.txt": "v1"})
-    seen = 'echo "${SNAP_TEST_FAKE_ROOT:-user}" > "$HOME/seen"\n'
+    seen = 'echo "${MOLT_TEST_FAKE_ROOT:-user}" > "$HOME/seen"\n'
     write_files(env.root, {"scripts/seen.sh": seen})
     write_configs(
         env.root, {"system": ("$HOME/force-sudo-root", ["f.txt"])},
@@ -2519,12 +2522,12 @@ def test_e2e_restore_to_host_re_runs_with_sudo_there_only_when_needed(env, hosts
     remote = hosts.home("web-01")
     write_files(remote, {"force-sudo-root/f.txt": "old"})
 
-    # snap.py on the host sees the root as unwritable; the host's sudo makes it "root"
+    # molt.py on the host sees the root as unwritable; the host's sudo makes it "root"
     site = hosts.base / "site"
     result = env.run(
         "restore", "-r", str(env.root), "--to", "user@web-01", "--run-scripts",
         extra_env={
-            "SNAP_TEST_FORCE_SUDO": "1",
+            "MOLT_TEST_FORCE_SUDO": "1",
             "PYTHONPATH": f"{site}{os.pathsep}{env.env['PYTHONPATH']}",
         },
     )
@@ -2535,7 +2538,7 @@ def test_e2e_restore_to_host_re_runs_with_sudo_there_only_when_needed(env, hosts
     assert "Re-running the restore with sudo...\nStarting restore as root\n" in result.stdout
     assert not env.sudo_marker.exists()  # never this machine's sudo
 
-    # The host's sudo ran snap.py (keeping the login HOME), which ran the script as root
+    # The host's sudo ran molt.py (keeping the login HOME), which ran the script as root
     [sudo_call] = [line for line in hosts.calls() if line.startswith("sudo ")]
     assert sudo_call.startswith(f"sudo web-01 env HOME={remote} ")
     assert " restore --from " in sudo_call and sudo_call.endswith(" --run-scripts")
@@ -2555,7 +2558,7 @@ def test_e2e_capture_to_host_copies_the_whole_snapshot(env, hosts):
     result = env.run("capture", "-r", str(env.root), "--to", "user@web-01", "--run-scripts")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    [snapshot] = hosts.home("web-01").glob(".snap/captures/*/*/*")
+    [snapshot] = hosts.home("web-01").glob(".molt/captures/*/*/*")
     assert sorted(p.name for p in snapshot.iterdir()) == [
         "Brewfile", "dotfiles.tar.gz", "snapshot.toml",
     ]
@@ -2604,7 +2607,7 @@ def test_e2e_restore_from_one_host_on_another(env, hosts):
     # A failed restore on web-02 still removes the local copy and the work dir
     result = env.run(
         "restore", "-r", str(env.root), "--from", "user@web-01", "--to", "user@web-02",
-        extra_env={"TMPDIR": str(tmpdir), "FAKE_SSH_FAIL": "snap.py restore"},
+        extra_env={"TMPDIR": str(tmpdir), "FAKE_SSH_FAIL": "molt.py restore"},
     )
     assert result.returncode == 1
     assert result.stderr.endswith("Error: Restore failed on user@web-02 (exit status 1)\n")
@@ -2646,10 +2649,10 @@ def test_e2e_migrate_to_host_keeps_the_restore_selection(env, hosts):
     # [restore.tar] archives picks dotfiles only; the host got it as its restore.toml
     assert (remote / ".zshrc").read_text() == "v1"
     assert not (remote / ".vimrc").exists()
-    assert snap.tomllib.loads((remote / "restore-config-seen").read_text()) == {
+    assert molt.tomllib.loads((remote / "restore-config-seen").read_text()) == {
         "tar": {"archives": ["dotfiles"]},
         "scripts": {"before": ["scripts/seen.sh"]},
-        "snap": {"table": "restore.tar"},  # so its messages name [restore.tar]
+        "molt": {"table": "restore.tar"},  # so its messages name [restore.tar]
     }
     # The capture script ran here; its Brewfile travelled in the snapshot to the host
     assert (remote / "Brewfile-seen").read_text() == f"brew from {env.home.name}\n"
@@ -2674,7 +2677,7 @@ def test_e2e_migrate_from_host(env, hosts):
     assert result.returncode == 0, result.stdout + result.stderr
     assert (env.home / ".zshrc").read_text() == "on web-01"
     assert (env.home / ".vimrc").read_text() == "v1"  # not in [restore.tar] archives
-    # The capture script ran on the host (by snap.py there), the restore script here
+    # The capture script ran on the host (by molt.py there), the restore script here
     assert (env.home / "Brewfile-seen").read_text() == "brew from home\n"
     commands = hosts.ssh_commands("user@web-01")
     work_dir = work_dir_of(commands, "capture")
@@ -2711,9 +2714,9 @@ def test_e2e_migrate_from_one_host_to_another(env, hosts):
     assert list(hosts.tmp("web-02").iterdir()) == []
 
 
-def test_e2e_remote_snap_root_with_remote_capture_and_restore(env, hosts):
+def test_e2e_remote_molt_root_with_remote_capture_and_restore(env, hosts):
     # -r names where configs, scripts and captures live; --from/--to where the work runs
-    remote_root = remote_snap_root(hosts, "web-01", {"dotfiles": ("$HOME", [".zshrc"])})
+    remote_root = remote_molt_root(hosts, "web-01", {"dotfiles": ("$HOME", [".zshrc"])})
     write_files(hosts.home("web-02"), {".zshrc": "on web-02"})
     tmpdir = local_tmpdir(env)
     local_tmp = {"TMPDIR": str(tmpdir)}
@@ -2725,11 +2728,11 @@ def test_e2e_remote_snap_root_with_remote_capture_and_restore(env, hosts):
 
     result = env.run("restore", "-r", "user@web-01", "--to", "user@web-03", extra_env=local_tmp)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "  From: user@web-01:.snap/captures (latest)\n" in result.stdout
+    assert "  From: user@web-01:.molt/captures (latest)\n" in result.stdout
     assert (hosts.home("web-03") / ".zshrc").read_text() == "on web-02"
 
-    # snap.py never ran on the snap root's host
-    assert not any("snap.py" in c for c in hosts.ssh_commands("user@web-01"))
+    # molt.py never ran on the molt root's host
+    assert not any("molt.py" in c for c in hosts.ssh_commands("user@web-01"))
     assert list(tmpdir.iterdir()) == []
     for host in ("web-01", "web-02", "web-03"):
         assert list(hosts.tmp(host).iterdir()) == []
@@ -2769,7 +2772,7 @@ def test_e2e_every_remote_flow_has_a_dry_run(env, hosts, command, scripts):
     capture_toml = env.root / "configs" / "capture.toml"
     capture_toml.write_text(capture_toml.read_text() + both)
     write_migrate_toml(env.root)
-    remote_root = remote_snap_root(hosts, "web-01", {"dotfiles": ("$HOME", [".zshrc"])})
+    remote_root = remote_molt_root(hosts, "web-01", {"dotfiles": ("$HOME", [".zshrc"])})
     write_files(remote_root, {"scripts/mark.sh": marker})
     assert env.run("capture", "-r", str(env.root)).returncode == 0
     assert env.run("capture", "-r", str(env.root), "--to", "user@web-01").returncode == 0
@@ -2786,7 +2789,7 @@ def test_e2e_every_remote_flow_has_a_dry_run(env, hosts, command, scripts):
     assert "Traceback" not in result.stderr
     assert "Error" not in result.stderr
     assert result.stdout.endswith("[DRY-RUN] Dry run completed; no changes were made\n")
-    # Only read-only queries reached a host: the snap root copy and the latest lookup
+    # Only read-only queries reached a host: the molt root copy and the latest lookup
     for line in hosts.calls():
         assert (
             line.startswith("rsync ") and "--include=/configs/" in line
@@ -2800,39 +2803,39 @@ def test_e2e_every_remote_flow_has_a_dry_run(env, hosts, command, scripts):
 # --- Remote runs: unit checks --- #
 
 
-def test_remote_scripts_keep_their_paths_in_the_snap_root(tmp_path):
+def test_remote_scripts_keep_their_paths_in_the_molt_root(tmp_path):
     write_files(tmp_path, {"scripts/a.sh": "", "scripts/sub/b.sh": "", "top.sh": ""})
     config = {"scripts": {
         "before": ["scripts/a.sh", "./scripts/sub/b.sh", "scripts/missing.sh"],
         "after": ["top.sh", "scripts/a.sh"],
     }}
 
-    scripts = snap.remote_scripts(tmp_path, config, "user@web-01")
+    scripts = molt.remote_scripts(tmp_path, config, "user@web-01")
 
     assert [str(s) for s in scripts] == ["scripts/a.sh", "scripts/sub/b.sh", "top.sh"]
-    assert snap.remote_layout(["configs", "scripts"], scripts) == [
+    assert molt.remote_layout(["configs", "scripts"], scripts) == [
         "configs", "scripts", "scripts/sub",
     ]
 
 
 @pytest.mark.parametrize("path", ["../outside.sh", "/usr/local/bin/setup.sh", "a/../../b.sh"])
-def test_remote_scripts_outside_the_snap_root_stop_the_run(tmp_path, capsys, path):
+def test_remote_scripts_outside_the_molt_root_stop_the_run(tmp_path, capsys, path):
     with pytest.raises(SystemExit):
-        snap.remote_scripts(tmp_path, {"scripts": {"after": [path]}}, "user@web-01")
+        molt.remote_scripts(tmp_path, {"scripts": {"after": [path]}}, "user@web-01")
     assert f"Error: Cannot copy script {path} to user@web-01: it is outside" in (
         capsys.readouterr().err
     )
 
 
 def test_remote_child_runs_python3_from_the_path(monkeypatch):
-    monkeypatch.setattr(snap, "__verbose__", True)
-    work_dir = snap.PurePosixPath("/tmp/snap-restore.Ab3dEf9h")
+    monkeypatch.setattr(molt, "__verbose__", True)
+    work_dir = molt.PurePosixPath("/tmp/molt-restore.Ab3dEf9h")
 
-    line = snap.remote_child(work_dir, "restore", "--from", work_dir / "snapshot")
+    line = molt.remote_child(work_dir, "restore", "--from", work_dir / "snapshot")
 
     assert line == (
-        "cd /tmp/snap-restore.Ab3dEf9h && python3 snap.py restore "
-        "--from /tmp/snap-restore.Ab3dEf9h/snapshot --verbose"
+        "cd /tmp/molt-restore.Ab3dEf9h && python3 molt.py restore "
+        "--from /tmp/molt-restore.Ab3dEf9h/snapshot --verbose"
     )
 
 
@@ -2844,11 +2847,12 @@ def test_remote_child_runs_python3_from_the_path(monkeypatch):
 ])
 def test_remote_snapshot_id_needs_one_plain_directory(capsys, output):
     with pytest.raises(SystemExit):
-        snap.remote_snapshot_id(output, snap.PurePosixPath("/tmp/w/out"), "user@web-01")
+        molt.remote_snapshot_id(output, molt.PurePosixPath("/tmp/w/out"), "user@web-01")
     assert "Error: Cannot find the snapshot on user@web-01" in capsys.readouterr().err
 
     motd = "Welcome to web-01\n/tmp/w/out/abc1234/\n"
-    assert snap.remote_snapshot_id(motd, snap.PurePosixPath("/tmp/w/out"), "web-01") == "abc1234"
+    out_dir = molt.PurePosixPath("/tmp/w/out")
+    assert molt.remote_snapshot_id(motd, out_dir, "web-01") == "abc1234"
 
 
 # --- Review fixes: remote paths, sudo env, backups, messages --- #
@@ -2859,20 +2863,20 @@ def test_remote_snapshot_id_needs_one_plain_directory(capsys, output):
 ])
 def test_parse_remote_arg_rejects_paths_rsync_cannot_pass_safely(value):
     with pytest.raises(SystemExit):
-        snap.parse_remote_arg(value, "--to")
+        molt.parse_remote_arg(value, "--to")
 
 
 def test_parse_remote_arg_keeps_ordinary_remote_paths():
-    assert snap.parse_remote_arg("user@host:~/snaps/v1.2_x+y=z,%@-") == (
+    assert molt.parse_remote_arg("user@host:~/snaps/v1.2_x+y=z,%@-") == (
         "user@host", Path("~/snaps/v1.2_x+y=z,%@-")
     )
 
 
 def test_remote_workdir_never_uses_a_path_with_shell_characters(monkeypatch, capsys):
-    calls = fake_ssh_runs(monkeypatch, {"mktemp": "/tmp/my dir/snap-restore.Ab3dEf9h\n"})
+    calls = fake_ssh_runs(monkeypatch, {"mktemp": "/tmp/my dir/molt-restore.Ab3dEf9h\n"})
 
     with pytest.raises(SystemExit):
-        snap.remote_workdir("user@web-01", "restore", ["configs"])
+        molt.remote_workdir("user@web-01", "restore", ["configs"])
 
     assert [cmd[-1].split()[0] for cmd, _ in calls] == ["mktemp"]
     assert "Cannot create a work directory on user@web-01" in capsys.readouterr().err
@@ -2882,7 +2886,7 @@ def test_latest_snapshot_with_shell_characters_is_refused(monkeypatch, capsys):
     fake_ssh_runs(monkeypatch, {"ls -1t": "caps/2026/09-23/a$(id)/snapshot.toml\n"})
 
     with pytest.raises(SystemExit):
-        snap.resolve_remote_snapshot("user@web-01", "caps")
+        molt.resolve_remote_snapshot("user@web-01", "caps")
 
     assert "Cannot use snapshot caps/2026/09-23/a$(id) on user@web-01" in (
         capsys.readouterr().err
@@ -2899,7 +2903,7 @@ def test_sudo_restore_never_passes_variables_that_change_what_runs(tmp_path, mon
         def wait(self):
             return 0
 
-    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(molt.subprocess, "Popen", FakePopen)
     for name in ("PYTHONPATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "XDG_DATA_HOME"):
         monkeypatch.setenv(name, "/evil" if name != "XDG_DATA_HOME" else "/data")
     snapshot_config = {"tar": {
@@ -2912,7 +2916,7 @@ def test_sudo_restore_never_passes_variables_that_change_what_runs(tmp_path, mon
     args = argparse.Namespace(root_host=None)
 
     with pytest.raises(SystemExit):
-        snap.sudo_restore(args, tmp_path, tmp_path, {"tar": {"archives": ["*"]}}, snapshot_config)
+        molt.sudo_restore(args, tmp_path, tmp_path, {"tar": {"archives": ["*"]}}, snapshot_config)
 
     env_args = [arg for arg in commands[0] if "=" in arg and not arg.startswith("-")]
     assert "XDG_DATA_HOME=/data" in env_args
@@ -2931,16 +2935,16 @@ def test_sudo_restore_keeps_the_users_table_name(tmp_path, monkeypatch):
         def wait(self):
             return 0
 
-    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(molt.subprocess, "Popen", FakePopen)
     args = argparse.Namespace(root_host=None)
 
     with pytest.raises(SystemExit):
-        snap.sudo_restore(
+        molt.sudo_restore(
             args, tmp_path, tmp_path, {"tar": {"archives": ["x"]}}, {}, table="restore.tar"
         )
 
-    assert snap.tomllib.loads(configs[0]) == {
-        "tar": {"archives": ["x"]}, "snap": {"table": "restore.tar"},
+    assert molt.tomllib.loads(configs[0]) == {
+        "tar": {"archives": ["x"]}, "molt": {"table": "restore.tar"},
     }
 
 
@@ -2955,8 +2959,8 @@ def test_same_root_spelled_two_ways_is_rotated_once(tmp_path):
     beta = make_archive(tmp_path, "beta", src, ["b.txt"])
     rotated = set()
 
-    assert snap.restore_category(alpha, str(home), ".bak", rotated=rotated)
-    assert snap.restore_category(beta, str(tmp_path / "alias" / ".." / "home"), ".bak",
+    assert molt.restore_category(alpha, str(home), ".bak", rotated=rotated)
+    assert molt.restore_category(beta, str(tmp_path / "alias" / ".." / "home"), ".bak",
                                  rotated=rotated)
 
     assert (tmp_path / "home.bak" / "alpha" / "a.txt").read_text() == "old a"
@@ -2967,10 +2971,10 @@ def test_same_root_spelled_two_ways_is_rotated_once(tmp_path):
 @pytest.mark.parametrize("name", [".", ".."])
 def test_dot_archive_names_are_never_restored_or_captured(tmp_path, name):
     (tmp_path / f"{name}.tar.gz").write_bytes(b"")
-    assert snap.snapshot_archives(tmp_path, {"tar": {name: {"root": "/x"}}}, ".tar.gz") == []
+    assert molt.snapshot_archives(tmp_path, {"tar": {name: {"root": "/x"}}}, ".tar.gz") == []
 
     with pytest.raises(SystemExit):
-        snap.verify_capture_config({"tar": {name: {"root": "/x", "dirs": ["a"]}}}, "c.toml")
+        molt.verify_capture_config({"tar": {name: {"root": "/x", "dirs": ["a"]}}}, "c.toml")
 
 
 def test_e2e_restore_to_host_passes_disable_rollback(env, hosts):
@@ -2998,7 +3002,7 @@ def test_e2e_interrupted_restore_on_host_exits_130(env, hosts):
 
     result = env.run(
         "restore", "-r", str(env.root), "--to", "user@web-01",
-        extra_env={"FAKE_SSH_FAIL": "snap.py restore", "FAKE_SSH_FAIL_STATUS": "130"},
+        extra_env={"FAKE_SSH_FAIL": "molt.py restore", "FAKE_SSH_FAIL_STATUS": "130"},
     )
 
     assert result.returncode == 130
@@ -3066,8 +3070,8 @@ def test_e2e_capture_to_host_is_private_there(env, hosts):
 
     assert result.returncode == 0, result.stdout + result.stderr
     commands = hosts.ssh_commands("user@web-01")
-    assert any(c.startswith("umask 077 && mkdir -p .snap/captures/") for c in commands)
-    [snapshot] = hosts.home("web-01").glob(".snap/captures/*/*/*")
+    assert any(c.startswith("umask 077 && mkdir -p .molt/captures/") for c in commands)
+    [snapshot] = hosts.home("web-01").glob(".molt/captures/*/*/*")
     directory = snapshot
     while directory != hosts.home("web-01"):
         assert stat_mode(directory) == 0o700, directory
@@ -3095,12 +3099,12 @@ def set_xattr(path, value):
     """Set a test xattr on a path; return False where the platform or filesystem can't."""
     if hasattr(os, "setxattr"):
         try:
-            os.setxattr(path, "user.snap-test", value.encode())
+            os.setxattr(path, "user.molt-test", value.encode())
             return True
         except OSError:
             return False
     if sys.platform == "darwin" and shutil.which("xattr"):
-        argv = ["xattr", "-w", "user.snap-test", value, str(path)]
+        argv = ["xattr", "-w", "user.molt-test", value, str(path)]
         return subprocess.run(argv, capture_output=True).returncode == 0
     return False
 
@@ -3109,10 +3113,10 @@ def get_xattr(path):
     """Return a path's test xattr, or None."""
     if hasattr(os, "getxattr"):
         try:
-            return os.getxattr(path, "user.snap-test").decode()
+            return os.getxattr(path, "user.molt-test").decode()
         except OSError:
             return None
-    argv = ["xattr", "-p", "user.snap-test", str(path)]
+    argv = ["xattr", "-p", "user.molt-test", str(path)]
     result = subprocess.run(argv, capture_output=True, text=True)
     return result.stdout.strip() if result.returncode == 0 else None
 
@@ -3143,7 +3147,7 @@ def test_backup_is_the_same_inode_with_every_attribute(tmp_path):
     before = {name: (home / "a" / name).lstat() for name in ("f.txt", "sub", "link")}
     archive = make_archive(tmp_path, "cat", src, ["a"])
 
-    assert snap.restore_category(archive, str(home), ".bak")
+    assert molt.restore_category(archive, str(home), ".bak")
 
     backup = tmp_path / "home.bak" / "cat" / "a"
     for name, info in before.items():
@@ -3171,7 +3175,7 @@ def test_rollback_moves_the_same_inode_back(tmp_path, monkeypatch):
 
     fail_on_extract(monkeypatch, "b", OSError("disk full"))
 
-    assert not snap.restore_category(archive, str(home), ".bak")
+    assert not molt.restore_category(archive, str(home), ".bak")
     assert {name: (home / name).lstat().st_ino for name in before} == before
     assert stat_mode(home / "a" / "f.txt") == 0o640
     assert (home / "a" / "f.txt").stat().st_mtime == MTIME
@@ -3189,7 +3193,7 @@ def cross_device_backups(monkeypatch):
             raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
         return real_rename(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr(snap.os, "rename", rename)
+    monkeypatch.setattr(molt.os, "rename", rename)
 
 
 def test_backup_across_filesystems_is_a_copy_with_attributes(tmp_path, monkeypatch):
@@ -3200,7 +3204,7 @@ def test_backup_across_filesystems_is_a_copy_with_attributes(tmp_path, monkeypat
     cross_device_backups(monkeypatch)
     archive = make_archive(tmp_path, "cat", src, ["a"])
 
-    assert snap.restore_category(archive, str(home), ".bak")
+    assert molt.restore_category(archive, str(home), ".bak")
 
     backup = tmp_path / "home.bak" / "cat" / "a"
     assert (backup / "f.txt").read_text() == "old"
@@ -3227,7 +3231,7 @@ def test_rollback_across_filesystems_copies_back(tmp_path, monkeypatch):
 
     fail_on_extract(monkeypatch, "b", OSError("disk full"))
 
-    assert not snap.restore_category(archive, str(home), ".bak")
+    assert not molt.restore_category(archive, str(home), ".bak")
     assert list_tree(home) == [
         "a", "a/f.txt", "a/h.txt", "a/link", "a/sub", "a/sub/g.txt", "b", "b/orig.txt",
     ]
@@ -3241,10 +3245,10 @@ def test_move_path_copies_only_across_filesystems(tmp_path, monkeypatch):
     def rename(src, dst):
         raise PermissionError(errno.EACCES, "Permission denied")
 
-    monkeypatch.setattr(snap.os, "rename", rename)
+    monkeypatch.setattr(molt.os, "rename", rename)
 
     with pytest.raises(PermissionError):
-        snap.move_path(tmp_path / "src", tmp_path / "bak" / "src")
+        molt.move_path(tmp_path / "src", tmp_path / "bak" / "src")
     assert (tmp_path / "src" / "f.txt").exists()
 
 
@@ -3267,13 +3271,13 @@ def test_capture_excludes_matching_members(tmp_path, monkeypatch):
         ".cache/data": "x",
         "top.log": "x",
     })
-    monkeypatch.setattr(snap, "__verbose__", True)
+    monkeypatch.setattr(molt, "__verbose__", True)
     exclude = ["node_modules", "*.log", ".cache/*"]
     paths = ["proj", ".cache", "top.log"]
 
     outdir = tmp_path / "out"
     outdir.mkdir()
-    archive, lines, _ = snap.archive_create("cat", str(src), paths, outdir, exclude=exclude)
+    archive, lines, _ = molt.archive_create("cat", str(src), paths, outdir, exclude=exclude)
 
     assert archive_names(archive) == [".cache", "proj", "proj/main.py", "proj/sub"]
     assert lines[1:] == [
@@ -3287,15 +3291,15 @@ def test_capture_excludes_matching_members(tmp_path, monkeypatch):
     ]
 
     # A dry run shows the same lines, and writes nothing
-    monkeypatch.setattr(snap, "__dry_run__", True)
+    monkeypatch.setattr(molt, "__dry_run__", True)
     dry_out = tmp_path / "dry"
-    _, dry_lines, _ = snap.archive_create("cat", str(src), paths, dry_out, exclude=exclude)
+    _, dry_lines, _ = molt.archive_create("cat", str(src), paths, dry_out, exclude=exclude)
     assert dry_lines == lines
     assert not dry_out.exists()
 
     # Without --verbose there are no exclude lines
-    monkeypatch.setattr(snap, "__verbose__", False)
-    _, quiet_lines, _ = snap.archive_create("cat", str(src), paths, dry_out, exclude=exclude)
+    monkeypatch.setattr(molt, "__verbose__", False)
+    _, quiet_lines, _ = molt.archive_create("cat", str(src), paths, dry_out, exclude=exclude)
     assert quiet_lines[1:] == ["include: 2 paths"]
 
 
@@ -3304,7 +3308,7 @@ def test_exclude_must_be_an_array_of_patterns(capsys, exclude):
     config = {"tar": {"cat": {"root": "/x", "dirs": ["a"], "exclude": exclude}}}
 
     with pytest.raises(SystemExit):
-        snap.verify_capture_config(config, "configs/capture.toml")
+        molt.verify_capture_config(config, "configs/capture.toml")
     assert (
         "Error: configs/capture.toml: the 'exclude' key in [tar.cat] must be an array "
         "of patterns"
@@ -3344,11 +3348,11 @@ def test_metadata_filter_skips_macos_files_at_any_depth(tmp_path, monkeypatch):
     })
     paths = ["d", "._top", ".DS_Store"]
 
-    monkeypatch.setattr(snap.sys, "platform", "darwin")
+    monkeypatch.setattr(molt.sys, "platform", "darwin")
     archive = make_archive(tmp_path, "mac", src, paths)
     assert archive_names(archive) == ["d", "d/e", "d/f.txt", "d/keep._x", "d/xDS_Store"]
 
-    monkeypatch.setattr(snap.sys, "platform", "linux")
+    monkeypatch.setattr(molt.sys, "platform", "linux")
     archive = make_archive(tmp_path, "linux", src, paths)
     assert len(archive_names(archive)) == 9
 
@@ -3359,20 +3363,20 @@ def test_metadata_filter_skips_macos_files_at_any_depth(tmp_path, monkeypatch):
 def test_remote_stop_command_stops_only_that_capture(tmp_path):
     if not shutil.which("pkill") or not shutil.which("bash"):
         pytest.skip("pkill and bash are needed")
-    work = tmp_path / "snap-capture.Ab3d.f9h"
-    other = tmp_path / "snap-capture.Ab3dXf9h"  # '.' in the pattern must not match 'X'
+    work = tmp_path / "molt-capture.Ab3d.f9h"
+    other = tmp_path / "molt-capture.Ab3dXf9h"  # '.' in the pattern must not match 'X'
     procs = []
     try:
         for directory in (work, other):
             directory.mkdir()
-            (directory / "snap.py").write_text("import time\ntime.sleep(60)\n")
+            (directory / "molt.py").write_text("import time\ntime.sleep(60)\n")
             procs.append(subprocess.Popen(
-                [sys.executable, "snap.py", "capture", "-r", str(directory), "-t", "x.toml"],
+                [sys.executable, "molt.py", "capture", "-r", str(directory), "-t", "x.toml"],
                 cwd=directory,
             ))
         time.sleep(0.5)  # let both start
 
-        command = f"{snap.remote_stop_command(work, 'capture')}; rm -rf {shlex.quote(str(work))}"
+        command = f"{molt.remote_stop_command(work, 'capture')}; rm -rf {shlex.quote(str(work))}"
         result = subprocess.run(["bash", "-c", command], timeout=30)
 
         # The cleanup's own shell survives and removes the dir
@@ -3397,14 +3401,14 @@ def test_sudo_restore_runs_python_without_user_site_packages(tmp_path, monkeypat
         def wait(self):
             return 0
 
-    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(molt.subprocess, "Popen", FakePopen)
     args = argparse.Namespace(root_host=None)
 
     with pytest.raises(SystemExit):
-        snap.sudo_restore(args, tmp_path, tmp_path, {"tar": {"archives": ["x"]}}, {})
+        molt.sudo_restore(args, tmp_path, tmp_path, {"tar": {"archives": ["x"]}}, {})
 
     [cmd] = cmds
-    assert cmd[cmd.index(sys.executable):][:3] == [sys.executable, "-s", str(snap.__script__)]
+    assert cmd[cmd.index(sys.executable):][:3] == [sys.executable, "-s", str(molt.__script__)]
 
 
 def test_sudo_restore_keeps_a_missing_archives_key(tmp_path, monkeypatch):
@@ -3417,15 +3421,15 @@ def test_sudo_restore_keeps_a_missing_archives_key(tmp_path, monkeypatch):
         def wait(self):
             return 0
 
-    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(molt.subprocess, "Popen", FakePopen)
     args = argparse.Namespace(root_host=None)
 
     with pytest.raises(SystemExit):
-        snap.sudo_restore(args, tmp_path, tmp_path, {"tarball": {}}, {}, table="restore.tar")
+        molt.sudo_restore(args, tmp_path, tmp_path, {"tarball": {}}, {}, table="restore.tar")
 
-    assert snap.tomllib.loads(configs[0]) == {
+    assert molt.tomllib.loads(configs[0]) == {
         "tar": {"archives": []},
-        "snap": {"table": "restore.tar", "no_archives_key": True},
+        "molt": {"table": "restore.tar", "no_archives_key": True},
     }
 
 
@@ -3441,8 +3445,8 @@ def test_e2e_child_config_reports_a_missing_archives_key(env):
     write_configs(env.root, {"dotfiles": ("$HOME", [".zshrc"])})
     assert env.run("capture", "-r", str(env.root)).returncode == 0
     # What sudo_restore writes for a migrate.toml without [restore.tar] 'archives'
-    (env.root / "configs" / "child.toml").write_text(snap.toml_dumps(
-        snap.restore_child_config({"tarball": {}}, "restore.tar")
+    (env.root / "configs" / "child.toml").write_text(molt.toml_dumps(
+        molt.restore_child_config({"tarball": {}}, "restore.tar")
     ))
 
     result = env.run("restore", "-r", str(env.root), "-t", "configs/child.toml")
@@ -3591,27 +3595,27 @@ def option_values(argv, option):
 ])
 def test_capture_config_checks_encryption(capsys, config, problem):
     with pytest.raises(SystemExit):
-        snap.verify_capture_config(config, "configs/capture.toml")
+        molt.verify_capture_config(config, "configs/capture.toml")
     assert f"Error: configs/capture.toml: {problem}" in capsys.readouterr().err
 
 
 def test_capture_config_names_the_migrate_age_table(capsys):
     config = {"tar": {"a": {"root": "/", "dirs": ["x"], "encrypt": True}}}
     with pytest.raises(SystemExit):
-        snap.verify_capture_config(config, "configs/migrate.toml", table="capture.tar")
+        molt.verify_capture_config(config, "configs/migrate.toml", table="capture.tar")
     assert "[capture.tar.a] sets 'encrypt', but [capture.age] has no" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("age", [{"recipients": ["age1x"]}, {"recipients_file": "~/r.txt"}])
 def test_capture_config_accepts_either_kind_of_recipients(age):
     config = {"age": age, "tar": {"a": {"root": "/", "dirs": ["x"], "encrypt": True}}}
-    snap.verify_capture_config(config, "configs/capture.toml")
+    molt.verify_capture_config(config, "configs/capture.toml")
 
 
 def test_archive_category_strips_the_age_extension():
-    assert snap.archive_category("secrets.tar.gz.age") == "secrets"
-    assert snap.archive_category("plain.tar.age") == "plain"
-    assert snap.archive_file("secrets", ".tar.gz", encrypted=True) == "secrets.tar.gz.age"
+    assert molt.archive_category("secrets.tar.gz.age") == "secrets"
+    assert molt.archive_category("plain.tar.age") == "plain"
+    assert molt.archive_file("secrets", ".tar.gz", encrypted=True) == "secrets.tar.gz.age"
 
 
 def test_e2e_capture_encrypts_with_age(env, fake_age):
@@ -3630,9 +3634,9 @@ def test_e2e_capture_encrypts_with_age(env, fake_age):
     assert stat_mode(encrypted) == 0o600
 
     # snapshot.toml marks the archive, and its checksum is over the .age file
-    tables = snap.tomllib.loads((snapshot / "snapshot.toml").read_text())["tar"]
+    tables = molt.tomllib.loads((snapshot / "snapshot.toml").read_text())["tar"]
     assert tables["secrets"]["encrypted"] is True
-    assert tables["secrets"]["checksum"] == snap.calculate_file_checksum(encrypted)
+    assert tables["secrets"]["checksum"] == molt.calculate_file_checksum(encrypted)
     assert "encrypted" not in tables["dotfiles"]
 
     # age -e with both kinds of recipients, in the private staging dir
@@ -3817,8 +3821,8 @@ def test_e2e_unselected_encrypted_archive_needs_no_identity(env, fake_age):
 
 def test_restore_child_config_ships_only_the_identity_path():
     config = {"tar": {"archives": ["*"]}, "age": {"identity": "~/key.txt", "other": "x"}}
-    assert snap.restore_child_config(config)["age"] == {"identity": "~/key.txt"}
-    assert "age" not in snap.restore_child_config({"tar": {"archives": ["*"]}})
+    assert molt.restore_child_config(config)["age"] == {"identity": "~/key.txt"}
+    assert "age" not in molt.restore_child_config({"tar": {"archives": ["*"]}})
 
 
 def test_split_migrate_config_keeps_both_age_tables():
@@ -3826,7 +3830,7 @@ def test_split_migrate_config_keeps_both_age_tables():
         "capture": {"tar": {}, "age": {"recipients": ["age1x"]}},
         "restore": {"tar": {"archives": ["*"]}, "age": {"identity": "~/key.txt"}},
     }
-    capture_config, restore_config = snap.split_migrate_config(config, "migrate.toml")
+    capture_config, restore_config = molt.split_migrate_config(config, "migrate.toml")
     assert capture_config["age"] == {"recipients": ["age1x"]}
     assert restore_config["age"] == {"identity": "~/key.txt"}
 
@@ -3841,16 +3845,16 @@ def test_sudo_restore_expands_the_identity_path(tmp_path, monkeypatch):
         def wait(self):
             return 0
 
-    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(molt.subprocess, "Popen", FakePopen)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("KEYS", str(tmp_path / "keys"))
     args = argparse.Namespace(root_host=None)
     restore_config = {"tar": {"archives": ["*"]}, "age": {"identity": "$KEYS/key.txt"}}
 
     with pytest.raises(SystemExit):
-        snap.sudo_restore(args, tmp_path, tmp_path, restore_config, {})
+        molt.sudo_restore(args, tmp_path, tmp_path, restore_config, {})
 
-    assert snap.tomllib.loads(configs[0])["age"] == {"identity": str(tmp_path / "keys/key.txt")}
+    assert molt.tomllib.loads(configs[0])["age"] == {"identity": str(tmp_path / "keys/key.txt")}
 
 
 def test_e2e_restore_to_host_decrypts_there_with_its_identity(env, hosts, fake_age):
@@ -3918,7 +3922,7 @@ def test_e2e_migrate_to_host_encrypts_and_decrypts_there(env, hosts, fake_age):
     assert [call["argv"][0] for call in fake_age()] == ["-e", "-d"]
 
 
-# --- Round 3 P5: snap list and snap prune --- #
+# --- Round 3 P5: molt list and molt prune --- #
 
 
 def days_ago(days):
@@ -3942,10 +3946,10 @@ def make_snapshot(root, rel, tables=None, rollback=".bak", size=100):
         tarball["rollback"] = rollback
     snapshot = {"tarball": tarball, "tar": {}}
     for name, table in tables.items():
-        filename = snap.archive_file(name, ".tar.gz", table.get("encrypted", False))
+        filename = molt.archive_file(name, ".tar.gz", table.get("encrypted", False))
         (path / filename).write_bytes(b"x" * size)
         snapshot["tar"][name] = dict(table, checksum="0" * 64)
-    (path / "snapshot.toml").write_text(snap.toml_dumps(snapshot))
+    (path / "snapshot.toml").write_text(molt.toml_dumps(snapshot))
     return path
 
 
@@ -3965,11 +3969,11 @@ def test_prune_select_keeps_what_any_rule_keeps():
     today = datetime.now().date()
     items = [(today - timedelta(days=age), age) for age in (0, 10, 40, 100)]
     cutoff = today - timedelta(days=30)
-    assert snap.prune_select(items, 2, None) == [40, 100]
-    assert snap.prune_select(items, None, cutoff) == [40, 100]
-    assert snap.prune_select(items, 3, cutoff) == [100]
-    assert snap.prune_select(items, 1, today - timedelta(days=5)) == [10, 40, 100]
-    assert snap.prune_select(items, 0, None) == [0, 10, 40, 100]
+    assert molt.prune_select(items, 2, None) == [40, 100]
+    assert molt.prune_select(items, None, cutoff) == [40, 100]
+    assert molt.prune_select(items, 3, cutoff) == [100]
+    assert molt.prune_select(items, 1, today - timedelta(days=5)) == [10, 40, 100]
+    assert molt.prune_select(items, 0, None) == [0, 10, 40, 100]
 
 
 def test_e2e_list_shows_snapshots_newest_first_and_backup_dirs(env):
@@ -3995,8 +3999,8 @@ def test_e2e_list_shows_snapshots_newest_first_and_backup_dirs(env):
     assert [re.split(" {2,}", line) for line in result.stdout.split("\n")] == [
         re.split(" {2,}", line) for line in columns_text([
             [f"Snapshots in {captures}, newest first:"],
-            [f"  {today}", "bbbbbbb", "3 archives", snap.size_shown(new), "1 encrypted"],
-            [f"  {days_ago(40).replace('/', '-')}", "aaaaaaa", "1 archive", snap.size_shown(old)],
+            [f"  {today}", "bbbbbbb", "3 archives", molt.size_shown(new), "1 encrypted"],
+            [f"  {days_ago(40).replace('/', '-')}", "aaaaaaa", "1 archive", molt.size_shown(old)],
             [""],
             ["Backup dirs, newest first per root:"],
             [f"  {env.home}.bak", "7 B", "current"],
@@ -4006,7 +4010,7 @@ def test_e2e_list_shows_snapshots_newest_first_and_backup_dirs(env):
             [""],
         ])
     ]
-    assert "2.2 KB" in snap.size_shown(old)
+    assert "2.2 KB" in molt.size_shown(old)
 
 
 def test_e2e_list_without_snapshots(env):
@@ -4017,14 +4021,14 @@ def test_e2e_list_without_snapshots(env):
 
 
 @pytest.mark.parametrize("command", [["list"], ["prune", "--keep", "1", "--yes"]])
-def test_e2e_list_and_prune_need_a_local_snap_root(env, hosts, command):
-    result = env.run(*command, "-r", "user@web-01:.snap")
+def test_e2e_list_and_prune_need_a_local_molt_root(env, hosts, command):
+    result = env.run(*command, "-r", "user@web-01:.molt")
 
     assert result.returncode == 1
     assert result.stderr == (
-        f"Error: snap.py {command[0]} works only with a local snap root, "
-        "not 'user@web-01:.snap'\n"
-        f"  Run snap.py {command[0]} on user@web-01 itself\n"
+        f"Error: molt.py {command[0]} works only with a local molt root, "
+        "not 'user@web-01:.molt'\n"
+        f"  Run molt.py {command[0]} on user@web-01 itself\n"
     )
     assert hosts.calls() == []
 
@@ -4049,8 +4053,8 @@ def test_e2e_prune_asks_before_deleting(env):
     assert result.returncode == 0, result.stderr
     assert (
         f"\nChecking 3 snapshots...\n"
-        f"  delete: {days_ago(40)}/aaaaaaa ({snap.size_shown(old)})\n"
-        f"  delete: {days_ago(400)}/ccccccc ({snap.size_shown(older)})\n"
+        f"  delete: {days_ago(40)}/aaaaaaa ({molt.size_shown(old)})\n"
+        f"  delete: {days_ago(400)}/ccccccc ({molt.size_shown(older)})\n"
         "  keep: 1 snapshot\n"
         "  Delete 2 snapshots? [y/N]: n\n"
         "  skip: declined\n"
@@ -4199,7 +4203,7 @@ def test_e2e_list_after_a_real_capture_and_restore(env):
 def test_sigint_deferred_holds_ctrl_c_until_the_block_ends():
     reached_end = []
     with pytest.raises(KeyboardInterrupt):
-        with snap.sigint_deferred():
+        with molt.sigint_deferred():
             os.kill(os.getpid(), signal.SIGINT)
             time.sleep(0.1)
             reached_end.append(True)
@@ -4208,16 +4212,16 @@ def test_sigint_deferred_holds_ctrl_c_until_the_block_ends():
 
 def test_capture_move_into_captures_runs_under_a_private_umask(tmp_path, monkeypatch):
     home = tmp_path / "home"
-    root = tmp_path / "snaproot"
+    root = tmp_path / "moltroot"
     (root / "configs").mkdir(parents=True)
     write_files(home, {".zshrc": "v1"})
     write_configs(root, {"dotfiles": ("$HOME", [".zshrc"])})
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr(snap, "__dry_run__", False)
-    monkeypatch.setattr(snap, "__verbose__", False)
-    monkeypatch.setattr(snap.sys, "argv", ["snap", "capture", "-r", str(root)])
+    monkeypatch.setattr(molt, "__dry_run__", False)
+    monkeypatch.setattr(molt, "__verbose__", False)
+    monkeypatch.setattr(molt.sys, "argv", ["molt", "capture", "-r", str(root)])
     umasks = []
-    real_move = snap.shutil.move
+    real_move = molt.shutil.move
 
     def move(src, dst):
         current = os.umask(0o022)
@@ -4225,10 +4229,10 @@ def test_capture_move_into_captures_runs_under_a_private_umask(tmp_path, monkeyp
         umasks.append(current)
         return real_move(src, dst)
 
-    monkeypatch.setattr(snap.shutil, "move", move)
+    monkeypatch.setattr(molt.shutil, "move", move)
     previous = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
     try:
-        snap.main()
+        molt.main()
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
@@ -4251,7 +4255,7 @@ def test_e2e_sigterm_during_capture_removes_its_staging_dir(env):
     tmpdir.mkdir()
 
     proc = subprocess.Popen(
-        [sys.executable, str(SNAP), "capture", "-r", str(env.root), "--run-scripts"],
+        [sys.executable, str(MOLT), "capture", "-r", str(env.root), "--run-scripts"],
         cwd=env.tmp, env=dict(env.env, TMPDIR=str(tmpdir)),
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
@@ -4270,3 +4274,393 @@ def test_e2e_sigterm_during_capture_removes_its_staging_dir(env):
 
     assert proc.returncode != 0
     assert list(tmpdir.iterdir()) == []  # the plaintext staging dir is gone
+
+
+# --- molt install --- #
+
+# A fake brew: answers the queries from files in $FAKE_STATE, logs every call (with the
+# no-upgrade env) to $FAKE_LOG, and 'installs' a Brewfile's brew/cask/tap lines into the
+# state files, unless $FAKE_BUNDLE_FAIL is set
+FAKE_BREW = r"""#!/bin/bash
+echo "brew $* [no_install_upgrade=${HOMEBREW_NO_INSTALL_UPGRADE:-}]" >> "$FAKE_LOG"
+state="$FAKE_STATE"
+case "$1" in
+    tap) cat "$state/taps" 2>/dev/null ;;
+    list) [ "$2" = --cask ] && kind=casks || kind=formulae; cat "$state/$kind" 2>/dev/null ;;
+    leaves) cat "$state/formulae" 2>/dev/null ;;
+    info) echo '{"casks": []}' ;;
+    bundle)
+        file="${4#--file=}"
+        cp "$file" "$state/last-brewfile"
+        [ -n "${FAKE_BUNDLE_FAIL:-}" ] && { echo "bundle failed" >&2; exit 1; }
+        sed -n 's/^brew "\(.*\)"$/\1/p' "$file" >> "$state/formulae"
+        sed -n 's/^cask "\(.*\)"$/\1/p' "$file" >> "$state/casks"
+        sed -n 's/^tap "\(.*\)"$/\1/p' "$file" >> "$state/taps"
+        ;;
+esac
+exit 0
+"""
+
+
+def fake_tool(bin_dir, name, body):
+    """Write an executable fake command into bin_dir."""
+    path = bin_dir / name
+    path.write_text(body)
+    path.chmod(0o755)
+    return path
+
+
+@pytest.fixture
+def inst(tmp_path, monkeypatch):
+    """An in-process 'molt install' with fake tools only: PATH is the fakes plus the
+    system dirs, the extra install dirs are off, and apps are looked for in a temp dir."""
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "root"
+    (root / "configs").mkdir(parents=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    apps = tmp_path / "Applications"
+    apps.mkdir()
+    log = tmp_path / "calls.log"
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin")
+    monkeypatch.setenv("FAKE_STATE", str(state))
+    monkeypatch.setenv("FAKE_LOG", str(log))
+    monkeypatch.setattr(molt, "INSTALL_PATH_DIRS", [])
+    monkeypatch.setattr(molt, "INSTALL_APP_DIRS", [str(apps)])
+    monkeypatch.setattr(molt, "__dry_run__", False)
+    monkeypatch.setattr(molt, "__verbose__", False)
+    monkeypatch.setitem(molt._reported, "errors", 0)
+    for name in ("brew", "mise", "npm", "cargo", "uv", "code", "mas"):
+        if shutil.which(name, path=os.environ["PATH"]) and not (bin_dir / name).exists():
+            # A real one in /usr/bin or /bin would answer instead of a missing tool
+            pytest.skip(f"a real {name} is on the system PATH")
+
+    def config(text):
+        (root / "configs" / "install.toml").write_text(text)
+
+    def installed(**files):
+        for name, lines in files.items():
+            (state / name).write_text("".join(f"{line}\n" for line in lines))
+
+    def run(*args):
+        monkeypatch.setattr(molt.sys, "argv", ["molt", "install", "-r", str(root), *args])
+        try:
+            molt.main()
+            return 0
+        except SystemExit as e:
+            return e.code
+
+    def calls():
+        return log.read_text().splitlines() if log.exists() else []
+
+    return argparse.Namespace(
+        tmp=tmp_path, home=home, root=root, bin=bin_dir, state=state, apps=apps,
+        config=config, installed=installed, run=run, calls=calls,
+    )
+
+
+def test_install_status_shows_missing_and_not_in_config(inst, capfd):
+    fake_tool(inst.bin, "brew", FAKE_BREW)
+    inst.installed(formulae=["jj", "wget"], casks=["ghostty"], taps=["homebrew/core"])
+    inst.config('[brew]\nformulae = ["jj", "ripgrep"]\ncasks = ["ghostty"]\n')
+
+    assert inst.run("--status") == 0
+    out = capfd.readouterr().out.splitlines()
+    assert "Checking brew..." in out
+    assert "  installed: 2 of 3" in out
+    assert "  missing: formula 'ripgrep'" in out
+    assert "  not in config: formula 'wget'" in out
+    assert not any("homebrew/core" in line for line in out)  # every Homebrew has it
+    assert out[-1] == "Status: 1 item missing, 1 not in the config"
+    assert not any(" bundle " in call for call in inst.calls())
+
+
+def test_install_dry_run_installs_nothing(inst, capfd):
+    fake_tool(inst.bin, "brew", FAKE_BREW)
+    inst.installed(formulae=["jj"])
+    inst.config('[brew]\nformulae = ["jj", "ripgrep"]\n')
+
+    assert inst.run("--dry-run") == 0
+    out = capfd.readouterr().out
+    assert "[DRY-RUN] Installing brew..." in out
+    assert "[DRY-RUN]   missing: formula 'ripgrep'" in out
+    assert "run: brew bundle install --no-upgrade '--file=<staging dir>/Brewfile'" in out
+    assert not any(" bundle " in call for call in inst.calls())
+    assert out.rstrip().endswith("Dry run completed; no changes were made")
+
+
+def test_install_bundles_only_missing_items_without_upgrades(inst, capfd):
+    fake_tool(inst.bin, "brew", FAKE_BREW)
+    inst.installed(formulae=["jj"], taps=["powershell/tap"])
+    inst.config(
+        '[brew]\ntaps = ["powershell/tap"]\nformulae = ["jj", "ripgrep", "powershell/tap/pwsh"]\n'
+        'casks = ["Ghostty"]\n'
+    )
+
+    assert inst.run() == 0
+    brewfile = (inst.state / "last-brewfile").read_text()
+    assert brewfile == 'brew "ripgrep"\nbrew "powershell/tap/pwsh"\ncask "Ghostty"\n'
+    [bundle] = [call for call in inst.calls() if " bundle " in call]
+    assert bundle.startswith("brew bundle install --no-upgrade --file=")
+    assert bundle.endswith("[no_install_upgrade=1]")
+
+    out = capfd.readouterr().out.splitlines()
+    assert "  ✓ formula 'ripgrep' installed" in out
+    assert "  ✓ cask 'Ghostty' installed" in out  # cask names match in any case
+    assert out[-1] == "✓ Install completed: 3 items installed"
+    assert not list(inst.tmp.glob("**/*.Brewfile"))
+
+
+def test_install_reports_what_is_still_missing_and_exits_1(inst, capfd, monkeypatch):
+    fake_tool(inst.bin, "brew", FAKE_BREW)
+    monkeypatch.setenv("FAKE_BUNDLE_FAIL", "1")
+    inst.config('[brew]\nformulae = ["ripgrep"]\n')
+
+    assert inst.run() == 1
+    captured = capfd.readouterr()
+    assert "Error: Cannot install 1 item from brew" in captured.err
+    assert "  formula 'ripgrep'" in captured.err
+    assert "brew bundle exit status 1" in captured.err
+    assert captured.out.rstrip().endswith("(1 error reported above)")
+
+
+def test_install_skips_a_section_whose_tool_is_missing(inst, capfd):
+    inst.config('[cargo]\ncrates = ["cargo-edit"]\n')
+
+    assert inst.run() == 0
+    out = capfd.readouterr().out.splitlines()
+    assert "Skipping cargo (cargo not found; 1 item not installed)" in out
+    assert out[-1] == "Install completed: 0 items installed, 1 skipped"
+
+
+def test_custom_items_are_shell_quoted(inst, capfd):
+    made = inst.tmp / "made"
+    made.mkdir()
+    inst.config(
+        "[[custom]]\n"
+        'name = "things"\n'
+        "items = [\"a b\", \"$(touch pwned)\", \"c'd\"]\n"
+        f'check = "test -e {made}/{{item}}"\n'
+        f'install = "touch {made}/{{item}}"\n'
+    )
+
+    assert inst.run() == 0
+    assert sorted(p.name for p in made.iterdir()) == ["$(touch pwned)", "a b", "c'd"]
+    assert not (inst.tmp / "pwned").exists()
+    out = capfd.readouterr().out
+    assert "✓ things 'a b' installed" in out
+
+    # Installed now, so a second run has nothing to do
+    assert inst.run() == 0
+    out = capfd.readouterr().out.splitlines()
+    assert "Skipping things (3 items already installed)" in out
+    assert out[-1] == "✓ Install completed: nothing was missing"
+
+
+def test_custom_list_command_replaces_the_checks(inst, capfd):
+    fake_tool(inst.bin, "lister", "#!/bin/sh\nprintf 'one\\nextra\\n'\n")
+    inst.config(
+        '[[custom]]\nname = "listed"\nitems = ["one", "two"]\n'
+        'list = "lister"\ninstall = "false"\nrequires = "lister"\n'
+    )
+
+    assert inst.run("--status") == 0
+    out = capfd.readouterr().out.splitlines()
+    assert "  installed: 1 of 2" in out
+    assert "  missing: listed 'two'" in out
+    assert "  not in config: listed 'extra'" in out
+
+
+def test_custom_requires_skips_the_entry(inst, capfd):
+    inst.config('[[custom]]\nname = "needs"\nrequires = "no-such-tool"\ncheck = "false"\n'
+                'install = "touch should-not-exist"\n')
+
+    assert inst.run() == 0
+    out = capfd.readouterr().out
+    assert "Skipping needs (no-such-tool not found; 1 item not installed)" in out
+    assert not (inst.tmp / "should-not-exist").exists()
+
+
+def test_manual_entries_are_only_listed(inst, capfd):
+    (inst.apps / "Here.app").mkdir()
+    inst.config(
+        '[[manual]]\nname = "Here"\napp = "Here.app"\n\n'
+        '[[manual]]\nname = "Slack"\napp = "Slack.app"\nsource = "Self Service"\n'
+    )
+
+    assert inst.run() == 0
+    out = capfd.readouterr().out.splitlines()
+    assert "Left to install by hand..." in out
+    assert "  'Slack': Self Service" in out
+    assert not any("'Here'" in line for line in out)
+    assert out[-1] == "Install completed: 0 items installed, 1 left to install by hand"
+
+
+@pytest.mark.parametrize("text, message", [
+    ('[brw]\nformulae = ["jj"]\n', "unknown table [brw]"),
+    ('[brew]\nformula = ["jj"]\n', "unknown key 'formula' in [brew]"),
+    ('[brew]\nformulae = "jj"\n', "the 'formulae' key in [brew] must be an array of names"),
+    ('[mas.apps]\nXcode = "497799835"\n', "[mas.apps] must map app names to App Store ids"),
+    ('[mise.tools]\nnode = 22\n', "'node' in [mise.tools] must be a version"),
+    ('[[custom]]\nname = "x"\ninstall = "true"\n', "[[custom]] 'x' needs a 'check' command"),
+    ('[[custom]]\nname = "x"\nitems = ["a"]\ninstall = "true"\n', "needs a 'check' or 'list'"),
+    ('[[custom]]\nname = "x"\ncheck = "true"\ninstall = "true"\n\n'
+     '[[custom]]\nname = "x"\ncheck = "true"\ninstall = "true"\n',
+     "two [[custom]] entries are named 'x'"),
+    ('[[manual]]\nname = "x"\n', "[[manual]] 'x' needs an 'app' or a 'check'"),
+    ('[custom]\nname = "x"\n', "custom must be an array of tables: [[custom]]"),
+    ('[install]\norder = ["brew", "pip"]\n', "unknown section 'pip' in [install] order"),
+])
+def test_install_config_errors(inst, capfd, text, message):
+    inst.config(text)
+    assert inst.run("--status") == 1
+    assert message in capfd.readouterr().err
+
+
+def test_install_order_only_and_skip(inst):
+    config = {
+        "install": {"order": ["custom", "brew"]},
+        "brew": {}, "cargo": {},
+        "custom": [{"name": "c", "check": "true", "install": "true"}],
+    }
+    sections = [g.section for g in molt.install_groups(config, "install.toml")]
+    assert sections == ["custom", "brew", "mas", "mise", "npm", "cargo", "uv", "vscode"]
+    only = molt.install_groups(config, "install.toml", only=["cargo", "custom"])
+    assert [g.section for g in only] == ["custom", "cargo"]
+    skipped = molt.install_groups(config, "install.toml", skip=["custom", "brew"])
+    assert "custom" not in [g.section for g in skipped]
+
+
+def test_install_section_list_rejects_unknown_names():
+    assert molt.install_section_list("brew, mas") == ["brew", "mas"]
+    with pytest.raises(argparse.ArgumentTypeError, match="unknown section 'pip'"):
+        molt.install_section_list("brew,pip")
+
+
+@pytest.mark.parametrize("versions, requested, expected", [
+    (["3.12.13"], "3.12", True),
+    (["3.12.13"], "3.1", False),
+    (["3.12.13"], "3.12.13", True),
+    ([], "latest", False),
+    (["24.1.0"], "latest", True),
+    (["22.11.0"], "lts", True),
+])
+def test_mise_satisfied(versions, requested, expected):
+    assert molt.mise_satisfied(versions, requested) is expected
+
+
+def test_mise_use_sets_every_version_of_a_tool(inst):
+    fake_tool(inst.bin, "mise", r"""#!/bin/bash
+echo "mise $*" >> "$FAKE_LOG"
+[ "$1" = ls ] && echo '{"python": [{"version": "3.12.1"}], "go": [{"version": "1.22"}]}'
+exit 0
+""")
+    inst.config('[mise.tools]\npython = ["3.12", "3.11"]\nnode = "latest"\n')
+
+    assert inst.run() == 1  # the fake never installs, so both are still missing
+    assert "mise use --global python@3.12 python@3.11 node@latest" in inst.calls()
+
+
+def test_brewfile_lists_brew_and_mas_and_keeps_existing_files(inst, capfd):
+    inst.config(
+        '[brew]\ntaps = ["a/b"]\nformulae = ["jj"]\ncasks = ["utm"]\n\n'
+        '[mas.apps]\nXcode = 497799835\n"Odd #{name}" = 1\n'
+    )
+    target = inst.tmp / "Brewfile"
+
+    assert inst.run("--brewfile", str(target)) == 0
+    assert target.read_text() == (
+        'tap "a/b"\nbrew "jj"\ncask "utm"\nbrew "mas"\n'
+        'mas "Xcode", id: 497799835\nmas "Odd \\#{name}", id: 1\n'
+    )
+    assert inst.run("--brewfile", str(target)) == 1
+    assert "Pass --force to replace it" in capfd.readouterr().err
+    assert inst.run("--brewfile", str(target), "--force") == 0
+
+
+def test_draft_is_a_valid_config_of_what_is_installed(inst, capfd):
+    fake_tool(inst.bin, "brew", FAKE_BREW)
+    fake_tool(inst.bin, "cargo", "#!/bin/sh\nprintf 'cargo-edit v0.1.0:\\n    cargo-add\\n'\n")
+    fake_tool(inst.bin, "npm", "#!/bin/sh\necho '{\"dependencies\": {\"npm\": {}, \"tsx\": {}}}'\n")
+    inst.installed(formulae=["jj"], casks=["utm"], taps=["homebrew/core", "a/b"])
+    (inst.apps / "Handmade.app").mkdir()
+    target = inst.tmp / "draft.toml"
+
+    assert inst.run("--draft", str(target)) == 0
+    draft = tomllib.loads(target.read_text())
+    assert draft["brew"] == {"taps": ["a/b"], "formulae": ["jj"], "casks": ["utm"]}
+    assert draft["cargo"] == {"crates": ["cargo-edit"]}
+    assert draft["npm"] == {"packages": ["tsx"]}
+    assert draft["manual"] == [{"name": "Handmade", "app": "Handmade.app"}]
+    molt.install_groups(draft, "draft.toml")  # it verifies as an install config
+
+    # Installing from the draft finds everything in place
+    assert inst.run("-t", str(target), "--status") == 0
+    assert capfd.readouterr().out.rstrip().endswith(
+        "Everything in the config is installed, and nothing else"
+    )
+
+
+def test_folder_app_picks_the_main_app(tmp_path):
+    for name in ["Cisco Secure Client - DART.app", "Cisco Secure Client.app",
+                 "Uninstall Cisco Secure Client.app"]:
+        (tmp_path / "Cisco" / name).mkdir(parents=True)
+    assert molt.folder_app(tmp_path / "Cisco").name == "Cisco Secure Client.app"
+
+
+def test_install_refuses_to_run_as_root(inst, capfd, monkeypatch):
+    monkeypatch.setattr(molt.os, "geteuid", lambda: 0)
+    inst.config("")
+    assert inst.run("--status") == 1
+    assert "Cannot run molt.py install as root" in capfd.readouterr().err
+
+
+def test_capture_config_install_table_is_verified():
+    config = {"tar": {"a": {"root": "/", "files": ["x"]}}, "install": {"draft": "yes"}}
+    with pytest.raises(SystemExit):
+        molt.verify_capture_config(config, "capture.toml")
+    config["install"] = {"draft": True}
+    molt.verify_capture_config(config, "capture.toml")
+
+
+def test_e2e_capture_saves_an_install_draft(env):
+    # The draft queries only the fakes here: they come first on PATH
+    for name in ("mise", "npm", "cargo", "uv", "code"):
+        fake_tool(env.tmp / "bin", name, "#!/bin/sh\nexit 1\n")
+    state = env.tmp / "state"
+    state.mkdir()
+    (state / "formulae").write_text("jj\n")
+    fake_tool(env.tmp / "bin", "brew", FAKE_BREW)
+    write_files(env.home, {".zshrc": "v1"})
+    write_configs(env.root, {"dotfiles": ("$HOME", [".zshrc"])})
+    capture_toml = env.root / "configs" / "capture.toml"
+    capture_toml.write_text(capture_toml.read_text() + "\n[install]\ndraft = true\n")
+
+    result = env.run(
+        "capture", "-r", str(env.root),
+        extra_env={"FAKE_STATE": str(state), "FAKE_LOG": str(env.tmp / "calls.log")},
+    )
+    assert result.returncode == 0, result.stderr
+    [draft] = list((env.root / "captures").glob("*/*/*/install.toml"))
+    assert stat_mode(draft) == 0o600
+    assert tomllib.loads(draft.read_text())["brew"]["formulae"] == ["jj"]
+    assert "✓ install.toml written" in result.stdout
+
+
+def test_resolve_root_falls_back_to_the_old_snap_root(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".snap").mkdir()
+    assert molt.resolve_root(molt.DEFAULT_ROOT) == (tmp_path / ".snap").resolve()
+    err = capsys.readouterr().err
+    assert "the root from before snap was renamed molt" in err
+    assert f"mv {tmp_path}/.snap {tmp_path}/.molt" in err
+
+    # Once ~/.molt exists, it wins
+    (tmp_path / ".molt").mkdir()
+    assert molt.resolve_root(molt.DEFAULT_ROOT) == (tmp_path / ".molt").resolve()

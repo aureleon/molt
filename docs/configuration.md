@@ -46,6 +46,9 @@ Key fields:
 - `encrypt` (optional): `true` encrypts the archive with age, for the recipients in the
   `[age]` table (see [Encryption](#encryption))
 
+`[install] draft = true` (optional) saves a draft [install.toml](#installtoml) of what the
+machine has installed in each snapshot (`[capture.install]` in migrate.toml).
+
 ### restore.toml
 
 Defines which archives to restore and when to run scripts. Names and patterns match the
@@ -103,6 +106,79 @@ before = ["scripts/fix-permissions.sh"]  # Runs on destination
 For encryption, `[capture.age]` holds the recipients and `[restore.age]` the identity, as
 `[age]` does in `capture.toml` and `restore.toml`.
 
+### install.toml
+
+Lists what `molt install` installs on a machine. Every section is optional. Start from a
+draft of what a machine has: `molt install --draft draft.toml`.
+
+```toml
+[install]
+order = ["custom", "brew"]   # optional; the sections it leaves out follow, in default order
+
+[brew]
+taps = ["powershell/tap"]
+formulae = ["jj", "ripgrep", "powershell/tap/powershell"]
+casks = ["ghostty", "utm"]
+
+[mas.apps]                   # App Store apps: name = id (the number in the App Store URL)
+Xcode = 497799835
+
+[mise]
+global = true                # 'mise use --global' (the default); false: 'mise install' only
+
+[mise.tools]
+node = "latest"
+python = ["3.12", "3.11"]    # the first one is the default
+
+[npm]
+packages = ["firebase-tools"]
+
+[cargo]
+crates = ["cargo-fuzz"]
+
+[uv]
+tools = ["ruff"]
+
+[vscode]
+extensions = ["ms-python.python"]
+
+[[custom]]                   # one thing: installed when 'check' exits non-zero
+name = "rustup"
+check = "command -v rustup"
+install = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+
+[[custom]]                   # a list of things, each checked and installed on its own
+name = "rust targets"
+requires = "rustup"          # skipped while rustup is missing
+items = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+list = "rustup target list --installed"   # or a 'check' with {item}
+install = "rustup target add {item}"
+
+[[manual]]                   # only checked, then listed as left to install by hand
+name = "Slack"
+app = "Slack.app"            # in /Applications or ~/Applications, or a path; or a 'check'
+source = "Self Service"      # 'source', 'url' and 'note' say how to get it
+```
+
+Sections install in this order, unless `[install] order` sets another: `brew`, `mas`,
+`custom`, `mise`, `npm`, `cargo`, `uv`, `vscode`, `manual`. Homebrew goes first since it
+installs most other tools; `custom` comes before the language tools, so it can install
+their managers.
+
+- `[brew]` and `[mas]` install through `brew bundle install --no-upgrade`, with only the
+  missing items in its Brewfile. A cask whose app is already in `/Applications` is
+  adopted. App Store apps install with mas, which brew installs first if needed; the App
+  Store must be signed in, and an app must have been bought or claimed before.
+- `[[custom]]` commands run with bash. `check` exits 0 when the thing is installed. With
+  `items`, each item gets its own check and install, with `{item}` replaced by the item,
+  shell-quoted. A `list` command that prints the installed items, one per line, takes the
+  place of the checks, and lets `--status` show the ones not in the config. `requires`
+  names a command the entry needs; while it is missing, the entry is skipped.
+- `[[manual]]` is for what no command should install: apps your device management pushes
+  or offers in a self-service portal, or installers without a cask.
+
+A typo is an error: an unknown table or key stops the run before anything is installed.
+
 ## Encryption
 
 An archive whose `[tar.<name>]` table sets `encrypt = true` is encrypted with the
@@ -147,7 +223,7 @@ encrypted archive's paths.
 On hosts: the host that runs the capture (`capture --from`, `migrate --from`) needs `age`,
 and reads `recipients_file` there. The host that runs the restore (`restore --to`,
 `migrate --to`) needs `age` and the identity file at the configured path on that host;
-snap.py sends only that path, never a key. When a restore re-runs itself with sudo, `age`
+molt.py sends only that path, never a key. When a restore re-runs itself with sudo, `age`
 must be on root's `PATH` too.
 
 ## Glob Patterns

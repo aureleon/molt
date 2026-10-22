@@ -1,7 +1,7 @@
 #!/bin/bash
 # Install the Homebrew packages from the snapshot's Brewfile (saved by capture-brew.sh).
 # install.sh installs this as scripts/restore-brew.sh; restore.toml runs it as an after
-# script ('snap restore --run-scripts'), in the snapshot directory.
+# script ('molt restore --run-scripts'), in the snapshot directory.
 
 set -euo pipefail
 

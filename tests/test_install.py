@@ -26,7 +26,7 @@ REPO = Path(__file__).resolve().parent.parent
 # Real tools install.sh uses; everything else on PATH is a shim
 TOOLS = [
     "basename", "cat", "chmod", "cmp", "cp", "dirname", "grep", "head", "id", "ls", "ln",
-    "mkdir", "readlink", "tail",
+    "mkdir", "mv", "readlink", "tail",
 ]
 
 SHIMS = {
@@ -98,7 +98,7 @@ def installer(tmp_path):
     """A checkout copy, temp HOME and shim PATH, and a run() for install.sh."""
     src = tmp_path / "src"
     src.mkdir()
-    for name in ["install.sh", "snap.py", "requirements.txt", "Brewfile", "packages.txt"]:
+    for name in ["install.sh", "molt.py", "requirements.txt", "Brewfile", "packages.txt"]:
         shutil.copy2(REPO / name, src / name)
     shutil.copytree(REPO / "configs", src / "configs")
     shutil.copytree(REPO / "scripts", src / "scripts")
@@ -130,7 +130,7 @@ def installer(tmp_path):
         "SHIM_LOG": str(log),
         "REAL_PYTHON": sys.executable,
     }
-    target = tmp_path / "snaproot"
+    target = tmp_path / "moltroot"
 
     def run(*args, extra_env=None, dest=target, stdin=subprocess.DEVNULL):
         argv = [bash, str(src / "install.sh"), *args]
@@ -171,9 +171,9 @@ def test_fresh_install(installer):
     target = installer.target
 
     assert tree(target) == [
-        "captures", "configs", "configs/capture.toml", "configs/migrate.toml",
-        "configs/restore.toml", "scripts", "scripts/capture-brew.sh",
-        "scripts/restore-brew.sh", "snap.py",
+        "captures", "configs", "configs/capture.toml", "configs/install.toml",
+        "configs/migrate.toml", "configs/restore.toml", "molt.py", "scripts",
+        "scripts/capture-brew.sh", "scripts/restore-brew.sh",
     ]
     for path in [target, target / "configs", target / "scripts", target / "captures"]:
         assert mode(path) == 0o700
@@ -181,12 +181,12 @@ def test_fresh_install(installer):
     assert (target / "configs" / "capture.toml").read_bytes() == (
         REPO / "configs" / "example-capture.toml").read_bytes()
 
-    link = installer.bin / "snap"
+    link = installer.bin / "molt"
     assert link.is_symlink()
-    assert os.readlink(link) == str(target / "snap.py")
+    assert os.readlink(link) == str(target / "molt.py")
 
     # Nothing else in HOME (no ~/Snapshots link)
-    assert tree(installer.home) == [".local", ".local/bin", ".local/bin/snap"]
+    assert tree(installer.home) == [".local", ".local/bin", ".local/bin/molt"]
 
     brewfile = installer.src / "Brewfile"
     assert installer.calls()[-2:] == [
@@ -198,7 +198,7 @@ def test_fresh_install(installer):
     assert lines[0] == "Starting install"
     assert lines[-1] == f"✓ Install completed in {target}"
     # A custom install dir says how to use it
-    assert f"snap capture -r {target}" in result.stdout
+    assert f"molt capture -r {target}" in result.stdout
     assert result.stderr == ""
 
 
@@ -231,7 +231,7 @@ def test_installed_command_runs_a_dry_run_capture(installer):
     (installer.home / ".zshrc").write_text("# rc\n")
     env = dict(os.environ, HOME=str(installer.home))
     result = subprocess.run(
-        [str(installer.bin / "snap"), "capture", "-r", str(installer.target), "--dry-run"],
+        [str(installer.bin / "molt"), "capture", "-r", str(installer.target), "--dry-run"],
         env=env, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
     )
     assert result.returncode == 0, result.stderr
@@ -255,27 +255,27 @@ def test_reinstall_keeps_user_files_and_makes_no_loops(installer):
     assert tree(installer.target) == before
     assert not (installer.target / "captures" / "captures").exists()
     assert "skip: configs/capture.toml (exists)" in result.stdout
-    assert "snap.py: up to date" in result.stdout
-    assert os.readlink(installer.bin / "snap") == str(installer.target / "snap.py")
+    assert "molt.py: up to date" in result.stdout
+    assert os.readlink(installer.bin / "molt") == str(installer.target / "molt.py")
 
 
-def test_reinstall_updates_snap_py(installer):
+def test_reinstall_updates_molt_py(installer):
     assert installer.run("--yes").returncode == 0
-    (installer.target / "snap.py").write_text("#!/usr/bin/env python3\n\"\"\"\nold\n\"\"\"\n")
+    (installer.target / "molt.py").write_text("#!/usr/bin/env python3\n\"\"\"\nold\n\"\"\"\n")
     result = installer.run("--yes")
     assert result.returncode == 0, result.stderr
-    assert "✓ snap.py updated" in result.stdout
-    assert (installer.target / "snap.py").read_bytes() == (REPO / "snap.py").read_bytes()
+    assert "✓ molt.py updated" in result.stdout
+    assert (installer.target / "molt.py").read_bytes() == (REPO / "molt.py").read_bytes()
 
 
-def test_reinstall_leaves_a_linked_snap_py_alone(installer, tmp_path):
+def test_reinstall_leaves_a_linked_molt_py_alone(installer, tmp_path):
     installer.target.mkdir()
-    own = tmp_path / "checkout-snap.py"
+    own = tmp_path / "checkout-molt.py"
     own.write_text("# a developer's copy\n")
-    (installer.target / "snap.py").symlink_to(own)
+    (installer.target / "molt.py").symlink_to(own)
     result = installer.run("--yes")
     assert result.returncode == 0, result.stderr
-    assert f"skip: snap.py (a link to {own})" in result.stdout
+    assert f"skip: molt.py (a link to {own})" in result.stdout
     assert own.read_text() == "# a developer's copy\n"
 
 
@@ -283,7 +283,7 @@ def test_no_tty_uses_the_defaults_and_says_so(installer):
     result = installer.run()   # stdin is /dev/null, no --yes
     assert result.returncode == 0, result.stderr
     assert "no terminal to ask on" in result.stdout
-    assert (installer.bin / "snap").is_symlink()
+    assert (installer.bin / "molt").is_symlink()
     assert result.stdout.splitlines()[-1].startswith("✓ Install completed")
 
 
@@ -291,29 +291,29 @@ def test_bin_dir_option(installer, tmp_path):
     bin_dir = tmp_path / "mybin"
     result = installer.run("--bin-dir", str(bin_dir))
     assert result.returncode == 0, result.stderr
-    assert os.readlink(bin_dir / "snap") == str(installer.target / "snap.py")
+    assert os.readlink(bin_dir / "molt") == str(installer.target / "molt.py")
     assert "is not on your PATH" in result.stdout
-    assert not (installer.bin / "snap").exists()
+    assert not (installer.bin / "molt").exists()
 
 
-def test_existing_snap_on_path_installs_as_snaps(installer):
-    write_shim(installer.shims / "snap", "echo snapd")
+def test_existing_molt_on_path_installs_as_molt_cli(installer):
+    write_shim(installer.shims / "molt", "echo another molt")
     result = installer.run("--yes")
     assert result.returncode == 0, result.stderr
-    assert not (installer.bin / "snap").exists()
-    assert os.readlink(installer.bin / "snaps") == str(installer.target / "snap.py")
-    assert f"'snap' is another program ({installer.shims / 'snap'}); using the name 'snaps'" \
-        in result.stdout
-    assert "snaps capture -r" in result.stdout
+    assert not (installer.bin / "molt").exists()
+    assert os.readlink(installer.bin / "molt-cli") == str(installer.target / "molt.py")
+    other = installer.shims / "molt"
+    assert f"'molt' is another program ({other}); using the name 'molt-cli'" in result.stdout
+    assert "molt-cli capture -r" in result.stdout
 
     # A re-run picks the same name
     result = installer.run("--yes")
     assert result.returncode == 0, result.stderr
-    assert sorted(os.listdir(installer.bin)) == ["snaps"]
+    assert sorted(os.listdir(installer.bin)) == ["molt-cli"]
 
 
 def test_name_option_overrides(installer):
-    write_shim(installer.shims / "snap", "echo snapd")
+    write_shim(installer.shims / "molt", "echo another molt")
     result = installer.run("--yes", "--name", "snapper")
     assert result.returncode == 0, result.stderr
     assert sorted(os.listdir(installer.bin)) == ["snapper"]
@@ -321,22 +321,22 @@ def test_name_option_overrides(installer):
 
 def test_never_replaces_another_program(installer):
     installer.bin.mkdir(parents=True)
-    other = installer.bin / "snap"
+    other = installer.bin / "molt"
     other.write_text("#!/bin/sh\necho mine\n")
-    result = installer.run("--yes", "--name", "snap")
+    result = installer.run("--yes", "--name", "molt")
     assert result.returncode == 1
-    assert f"Error: {other} exists and is not snap.py; not replacing it" in result.stderr
+    assert f"Error: {other} exists and is not molt.py; not replacing it" in result.stderr
     assert other.read_text() == "#!/bin/sh\necho mine\n"
     assert "✓ Install completed" not in result.stdout
 
 
 def test_old_copied_command_is_replaced_by_the_link(installer):
-    # Older versions of install.sh copied snap.py to ~/.local/bin/snap
+    # Older versions of install.sh copied molt.py to ~/.local/bin/molt
     installer.bin.mkdir(parents=True)
-    shutil.copy2(REPO / "snap.py", installer.bin / "snap")
+    shutil.copy2(REPO / "molt.py", installer.bin / "molt")
     result = installer.run("--yes")
     assert result.returncode == 0, result.stderr
-    assert os.readlink(installer.bin / "snap") == str(installer.target / "snap.py")
+    assert os.readlink(installer.bin / "molt") == str(installer.target / "molt.py")
 
 
 def test_failing_brew_fails_the_install(installer):
@@ -358,7 +358,7 @@ def test_brew_already_satisfied_installs_nothing(installer):
 @pytest.fixture
 def linux(installer):
     """Make install.sh see Linux with one package to install."""
-    (installer.src / "packages.txt").write_text("# needed\nsnap-test-pkg\nrsync\n")
+    (installer.src / "packages.txt").write_text("# needed\nmolt-test-pkg\nrsync\n")
     installer.env["FAKE_UNAME"] = "Linux"
     return installer
 
@@ -368,14 +368,14 @@ def test_linux_installs_missing_packages_with_sudo(linux):
     assert result.returncode == 0, result.stderr
     calls = linux.calls()
     assert "sudo apt-get update" in calls
-    assert "sudo apt-get install -y snap-test-pkg" in calls
+    assert "sudo apt-get install -y molt-test-pkg" in calls
     assert "✓ system packages installed" in result.stdout
 
 
 def test_linux_failing_package_manager_fails_the_install(linux):
     result = linux.run("--yes", extra_env={"FAKE_APT_FAIL": "1"})
     assert result.returncode == 1
-    assert "Error: Cannot install snap-test-pkg: 'sudo apt-get update' failed" in result.stderr
+    assert "Error: Cannot install molt-test-pkg: 'sudo apt-get update' failed" in result.stderr
     assert "✓ system packages" not in result.stdout
     assert "✓ Install completed" not in result.stdout
     assert not linux.target.exists()
@@ -391,7 +391,7 @@ def test_linux_without_a_package_manager_fails(linux):
 def test_failing_pip_is_only_a_warning(installer):
     result = installer.run("--yes", extra_env={"FAKE_NO_TQDM": "1", "FAKE_PIP_FAIL": "1"})
     assert result.returncode == 0, result.stderr
-    assert "Warning: Cannot install tqdm with pip; snap runs without progress bars" \
+    assert "Warning: Cannot install tqdm with pip; molt runs without progress bars" \
         in result.stderr
     assert "externally managed" in result.stdout
     assert "install.sh failed" not in result.stderr
@@ -409,16 +409,16 @@ def test_pip_installs_tqdm_when_missing(installer):
 def test_old_python_fails(installer):
     result = installer.run("--yes", extra_env={"FAKE_OLD_PYTHON": "1"})
     assert result.returncode == 1
-    assert "Error: snap.py needs Python 3.11 or later (found 3.9.6)" in result.stderr
+    assert "Error: molt.py needs Python 3.11 or later (found 3.9.6)" in result.stderr
     assert not installer.target.exists()
 
 
-def test_refuses_a_non_empty_directory_that_is_not_a_snap_root(installer):
+def test_refuses_a_non_empty_directory_that_is_not_a_molt_root(installer):
     installer.target.mkdir()
     (installer.target / "notes.txt").write_text("x")
     result = installer.run("--yes")
     assert result.returncode == 1
-    assert "is not empty and is not a snap root" in result.stderr
+    assert "is not empty and is not a molt root" in result.stderr
     assert tree(installer.target) == ["notes.txt"]
 
 
@@ -431,7 +431,7 @@ def test_unknown_option_fails_with_a_message(installer):
 def test_default_install_dir_needs_no_r(installer):
     result = installer.run("--yes", dest=None)
     assert result.returncode == 0, result.stderr
-    assert (installer.home / ".snap" / "snap.py").is_file()
+    assert (installer.home / ".molt" / "molt.py").is_file()
     assert "capture -r" not in result.stdout
 
 
@@ -446,7 +446,7 @@ def run_on_a_terminal(installer, answer, *args):
         os.close(leader)
 
 
-@pytest.mark.parametrize("answer, command", [("\n", "snap"), ("1\n", "snap"), ("3\n", None)])
+@pytest.mark.parametrize("answer, command", [("\n", "molt"), ("1\n", "molt"), ("3\n", None)])
 def test_terminal_asks_where_the_command_goes(installer, answer, command):
     result = run_on_a_terminal(installer, answer)
     assert result.returncode == 0, result.stderr
@@ -456,8 +456,8 @@ def test_terminal_asks_where_the_command_goes(installer, answer, command):
         assert (installer.bin / command).is_symlink()
     else:
         assert not installer.bin.exists()
-        assert f"skip: command (run {installer.target}/snap.py directly)" in result.stdout
-        assert f"{installer.target}/snap.py capture -r" in result.stdout
+        assert f"skip: command (run {installer.target}/molt.py directly)" in result.stdout
+        assert f"{installer.target}/molt.py capture -r" in result.stdout
 
 
 def test_terminal_invalid_choice_fails_with_a_message(installer):
@@ -468,7 +468,7 @@ def test_terminal_invalid_choice_fails_with_a_message(installer):
 
 def test_unexpected_failure_is_reported(installer):
     installer.target.mkdir()
-    (installer.target / "snap.py").write_text("")
+    (installer.target / "molt.py").write_text("")
     (installer.target / "scripts").write_text("not a directory")
     result = installer.run("--yes")
     assert result.returncode != 0
@@ -519,3 +519,40 @@ def test_restore_brew_script_runs_brew_as_the_user_under_sudo(installer, tmp_pat
         f"--file={work}/Brewfile"
         in installer.calls()
     )
+
+
+def old_snap_install(installer):
+    """An install from before the rename: ~/.snap with snap.py and a config, and its link."""
+    legacy = installer.home / ".snap"
+    (legacy / "configs").mkdir(parents=True)
+    (legacy / "configs" / "capture.toml").write_text("# mine\n")
+    shutil.copy2(REPO / "molt.py", legacy / "snap.py")
+    installer.bin.mkdir(parents=True)
+    (installer.bin / "snap").symlink_to(legacy / "snap.py")
+    return legacy
+
+
+def test_old_snap_root_moves_to_molt_with_yes(installer):
+    legacy = old_snap_install(installer)
+    result = installer.run("--yes", dest=None)
+    assert result.returncode == 0, result.stderr
+
+    root = installer.home / ".molt"
+    assert not legacy.exists()
+    assert (root / "configs" / "capture.toml").read_text() == "# mine\n"  # kept
+    assert (root / "molt.py").is_file()
+    assert f"✓ {legacy} moved to {root}" in result.stdout
+    assert f"rm {root}/snap.py" in result.stdout
+    assert f"rm {installer.bin}/snap" in result.stdout
+    assert result.stdout.splitlines()[-1] == f"✓ Install completed in {root}"
+
+
+def test_old_snap_root_is_updated_in_place_without_a_terminal(installer):
+    legacy = old_snap_install(installer)
+    result = installer.run(dest=None)
+    assert result.returncode == 0, result.stderr
+
+    assert not (installer.home / ".molt").exists()
+    assert (legacy / "molt.py").is_file()
+    assert f"keeping {legacy}" in result.stdout
+    assert result.stdout.splitlines()[-1] == f"✓ Install completed in {legacy}"

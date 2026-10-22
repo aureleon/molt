@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Run snap.py's checks: ruff, shellcheck and pytest. Exits 1 when any of them fails.
+# Run molt.py's checks: ruff, shellcheck and pytest. Exits 1 when any of them fails.
 #
 # Usage: ./check.sh [--fast] [pytest args...]
 #   --fast  Skip the slow end-to-end tests (pytest -m "not slow")
@@ -49,9 +49,9 @@ missing() {
 
 run_ruff() {
     if command -v ruff >/dev/null 2>&1; then
-        ruff check snap.py tests/
+        ruff check molt.py tests/
     elif python3 -m ruff --version >/dev/null 2>&1; then
-        python3 -m ruff check snap.py tests/
+        python3 -m ruff check molt.py tests/
     else
         missing ruff "Install it with: brew install ruff (or pipx install ruff)"
     fi

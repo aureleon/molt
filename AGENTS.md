@@ -1,20 +1,21 @@
-# Working on snap.py
+# Working on molt.py
 
-snap.py captures sets of files into tar archives (a *snapshot*), and restores them on this
-machine or on another one over SSH. `README.md` is the user documentation; this file is
+molt.py captures sets of files into tar archives (a *snapshot*), and restores them on this
+machine or on another one over SSH. `molt install` installs the packages and apps an
+install.toml lists. `README.md` is the user documentation; this file is
 for changing the code.
 
 ## Repository
 
 ```
-snap.py                  The whole program: one file, stdlib + optional tqdm
-install.sh               Installer: snap root, example configs, command link
+molt.py                  The whole program: one file, stdlib + optional tqdm
+install.sh               Installer: molt root, example configs, command link
 check.sh                 ruff + shellcheck + pytest (the only CI there is)
 pyproject.toml           ruff and pytest settings, the 'slow' marker
-configs/example-*.toml   Installed as configs/capture|restore|migrate.toml;
+configs/example-*.toml   Installed as configs/capture|restore|migrate|install.toml;
                          example-snapshot.toml only documents the snapshot format
 scripts/example-*.sh     Installed as scripts/capture-brew.sh, restore-brew.sh
-tests/test_snap.py       snap.py tests (unit tests in-process, end-to-end in a subprocess)
+tests/test_molt.py       molt.py tests (unit tests in-process, end-to-end in a subprocess)
 tests/test_install.py    install.sh tests, with shims for brew, apt-get, sudo, python3
 tests/conftest.py        Marks the end-to-end tests 'slow'
 Brewfile, packages.txt   System packages install.sh installs (rsync)
@@ -23,7 +24,7 @@ requirements.txt         tqdm, installed by install.sh when pip allows it
 
 ## Data flow
 
-The *snap root* (`-r`, default `./.snap`, then `~/.snap`) holds `configs/`, `scripts/` and
+The *molt root* (`-r`, default `./.molt`, then `~/.molt`) holds `configs/`, `scripts/` and
 `captures/`. With `-r host[:path]`, `main()` copies the host's `configs/` and `scripts/`
 into a local temp dir and uses that as the root.
 
@@ -51,8 +52,8 @@ into a local temp dir and uses that as the root.
    snapshot.toml lists are ever restored.
 3. Select with `[tar] archives` globs from restore.toml; decrypt selected `.age` archives
    into a private temp dir with `[age] identity`.
-4. `restore_needs_sudo`: if any target needs root, `sudo_restore` re-runs snap.py as
-   `sudo env <vars> <this python> -s snap.py restore ...` on the local copy (only the
+4. `restore_needs_sudo`: if any target needs root, `sudo_restore` re-runs molt.py as
+   `sudo env <vars> <this python> -s molt.py restore ...` on the local copy (only the
    allowed env vars; see `SUDO_ENV_BLOCKED`) and exits with the child's status.
 5. `extract_archives` -> `restore_category` per archive: the root's backup dir
    `<root><rollback>` is rotated once per run to `<root><rollback>_<timestamp>`; each
@@ -70,16 +71,30 @@ prune deletes only after a `[y/N]` prompt (or `--yes`), never with sudo.
 
 **check** prints `name: checksum` lines; those stdout lines are a stable format.
 
+**install** (`cmd_install`, local molt root only, never as root):
+1. `install_groups` builds and verifies one `InstallGroup` per section of install.toml,
+   in `install_order` (`[install] order`, then `INSTALL_SECTIONS`); each `[[custom]]`
+   entry is its own group. A built-in section the config leaves out gets an empty group,
+   so `--status` can show what its tool installed.
+2. Per group: `unavailable()` (its tool is missing: skipped), `items()`, `present()`
+   (read-only queries, which run in a dry run too), then `install(missing)` and
+   `present()` again; what is still missing is one Error. `[[manual]]` is only checked.
+3. `--status` (`install_status`) and `--brewfile` (`brewfile_text`) change nothing;
+   `--draft` (`install_draft_text`) builds a config from each group class's `draft()`.
+   capture's `[install] draft = true` writes one into the snapshot (`install_draft_write`).
+4. A new package manager is an `InstallGroup` subclass (`NamesGroup` for a plain array
+   of names), a name in `INSTALL_SECTIONS`, and an entry in `INSTALL_GROUPS`.
+
 ## Remote model
 
 - Only `ssh` and `rsync` touch hosts (`ssh_run`, `rsync_run`). A host is `user@host` or
   `host:`; host paths are relative to the login dir and limited to
   `REMOTE_PATH_CHARS`, because old rsync passes them to the remote shell unescaped.
-- `capture --from`, `restore --to` and `migrate` run snap.py *on the host*: a private
-  `mktemp -d` work dir (`remote_workdir`) gets snap.py itself (`__script__`), the one
+- `capture --from`, `restore --to` and `migrate` run molt.py *on the host*: a private
+  `mktemp -d` work dir (`remote_workdir`) gets molt.py itself (`__script__`), the one
   config this command uses (written as capture.toml or restore.toml), the scripts only
   with `--run-scripts`, and for a restore the snapshot. The work dir is removed in a
-  `finally`, and a still-running remote snap.py is stopped first (`remote_stop_command`).
+  `finally`, and a still-running remote molt.py is stopped first (`remote_stop_command`).
 - A remote restore runs over `ssh -t` so sudo can prompt; it re-runs itself with sudo
   on the host exactly like a local restore. Nothing secret is sent: an age identity
   stays a path on the host.
@@ -89,8 +104,11 @@ prune deletes only after a `[y/N]` prompt (or `--yes`), never with sudo.
 
 - Never run `restore`, `migrate` or `prune` without `--dry-run` outside a temp HOME: a
   real restore renames your files into backup dirs and may re-run itself with sudo.
-- Try things in `mktemp -d` dirs with `HOME=<tmp>/home`, a snap root there, and
-  `-r <tmp>/root`. Never touch `~/.snap` or real dotfiles.
+- Try things in `mktemp -d` dirs with `HOME=<tmp>/home`, a molt root there, and
+  `-r <tmp>/root`. Never touch `~/.molt` or real dotfiles.
+- Never run `molt install` without `--dry-run` or `--status` outside a temp HOME with
+  fake tools: it installs for real. Its tests (the `inst` fixture) put fakes first on
+  `PATH` and empty `INSTALL_PATH_DIRS`, so the real brew in /opt/homebrew is never found.
 - Never use real sudo, never contact real hosts. The tests put fake `sudo`, `ssh`,
   `rsync` and `age` first on `PATH` (see the `env` and `hosts` fixtures); do the same
   for manual runs.
@@ -108,9 +126,9 @@ prune deletes only after a `[y/N]` prompt (or `--yes`), never with sudo.
 ./check.sh --fast -k exclude   # extra args go to pytest
 ```
 
-- ruff: `ruff check snap.py tests/` with pyproject's settings (line length 100,
+- ruff: `ruff check molt.py tests/` with pyproject's settings (line length 100,
   F, E, W, B). shellcheck: install.sh, check.sh, scripts/*.sh.
-- Tests using the `env` fixture run snap.py in a subprocess and are marked slow by
+- Tests using the `env` fixture run molt.py in a subprocess and are marked slow by
   `tests/conftest.py`; all of test_install.py is slow.
 - Every behavior change gets a test. Update only the assertions whose behavior you
   changed.
@@ -119,7 +137,7 @@ prune deletes only after a `[y/N]` prompt (or `--yes`), never with sudo.
 
 ### Structure
 
-- Everything is in `snap.py`: no modules, no package. Sections are marked
+- Everything is in `molt.py`: no modules, no package. Sections are marked
   `# --- Section Name --- #`; add code to the section it belongs to.
 - stdlib only, plus tqdm, which stays optional: `dtqdm()` returns a no-op bar without it
   (the sudo child and remote hosts may not have it).
@@ -138,7 +156,8 @@ prune deletes only after a `[y/N]` prompt (or `--yes`), never with sudo.
   1) and details (level 2); `ok()` prints `✓` results; `warn()`, `error()`, `fatal()` go
   to stderr; `relay()` prints captured child output; `ask()` prompts; `finish()` prints
   the command's single final line. `print()` is used only by the Python-version guard,
-  `printd()` and check's data lines.
+  `printd()` and check's data lines; `install --brewfile -` and `--draft -` write their
+  file to stdout directly.
 - `✓` is the only symbol, only on stdout, only for success, never in a dry run. No
   emojis.
 - Wording follows the style spec the output was built from: sentence case, no trailing
@@ -164,8 +183,9 @@ prune deletes only after a `[y/N]` prompt (or `--yes`), never with sudo.
 - `fatal()` for errors that stop the run (exit 1); `error()` for ones that don't (the
   final line then drops `✓`); `warn()` for the rest. try/except only where the code can
   recover or report better.
-- Subprocesses capture their output and `relay()` it afterwards, except the two that
-  need the terminal: the sudo re-run and the `ssh -t` remote restore.
+- Subprocesses capture their output and `relay()` it afterwards, except the ones that
+  need the terminal: the sudo re-run, the `ssh -t` remote restore, and install commands
+  (`install_run`: installers prompt; stdin is /dev/null without a terminal).
 - Timeouts: short ssh commands have `COMMAND_TIMEOUT`; long ones (remote runs, scripts)
   have none; rsync has `--timeout`.
 - Temp dirs are always removed in `finally`.
@@ -186,7 +206,7 @@ prune deletes only after a `[y/N]` prompt (or `--yes`), never with sudo.
 
 - bash, `set -Eeuo pipefail`, shellcheck clean, and it must run on macOS's bash 3.2
   (no associative arrays; guard empty arrays under `set -u`).
-- Same output shape as snap.py (`Starting install`, steps, `✓` items, one final line,
+- Same output shape as molt.py (`Starting install`, steps, `✓` items, one final line,
   `Error:`/`Warning:` on stderr). Never overwrite a user's config, script or command;
   never hang without a terminal; a package-manager failure is an error, a pip failure
   (tqdm is optional) a warning.

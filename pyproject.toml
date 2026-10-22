@@ -1,4 +1,4 @@
-# Settings for the tools ./check.sh runs. snap.py is a single script, not a pip package:
+# Settings for the tools ./check.sh runs. molt.py is a single script, not a pip package:
 # install it with ./install.sh.
 
 [tool.ruff]
@@ -12,5 +12,5 @@ select = ["F", "E", "W", "B"]
 testpaths = ["tests"]
 addopts = "-p no:cacheprovider"
 markers = [
-    "slow: end-to-end tests that run snap.py or install.sh in a subprocess (./check.sh --fast skips them)",
+    "slow: end-to-end tests that run molt.py or install.sh in a subprocess (./check.sh --fast skips them)",
 ]

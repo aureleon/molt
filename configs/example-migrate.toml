@@ -15,7 +15,7 @@ rollback = ".bak"  # Extension for backing up existing files during restore
 # Capture configuration ([capture.*])
 #
 
-# Scripts run with 'snap migrate --run-scripts', on the SOURCE machine, in the snapshot
+# Scripts run with 'molt migrate --run-scripts', on the SOURCE machine, in the snapshot
 [capture.scripts]
 after = ["scripts/capture-brew.sh"]   # Saves a Brewfile in the snapshot
 # before = ["scripts/dump-database.sh"]
@@ -24,6 +24,10 @@ after = ["scripts/capture-brew.sh"]   # Saves a Brewfile in the snapshot
 # [capture.age]
 # recipients = ["age1..."]
 # recipients_file = "~/.config/age/recipients.txt"
+
+# A draft install.toml of what the source machine has installed, saved in the snapshot
+# [capture.install]
+# draft = true
 
 # SSH keys
 [capture.tar.ssh-keys]
@@ -69,7 +73,7 @@ archives = ["*"]
 # [restore.age]
 # identity = "~/.config/age/key.txt"
 
-# Scripts run with 'snap migrate --run-scripts', on the DESTINATION machine, in the snapshot
+# Scripts run with 'molt migrate --run-scripts', on the DESTINATION machine, in the snapshot
 [restore.scripts]
 after = ["scripts/restore-brew.sh"]   # Installs the captured Brewfile
 # before = ["scripts/stop-services.sh"]

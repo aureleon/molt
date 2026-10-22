@@ -1,7 +1,7 @@
 #!/bin/bash
 # Save the installed Homebrew packages as a Brewfile.
 # install.sh installs this as scripts/capture-brew.sh; capture.toml runs it as an after
-# script ('snap capture --run-scripts'), in the new snapshot directory, so the Brewfile
+# script ('molt capture --run-scripts'), in the new snapshot directory, so the Brewfile
 # goes with the snapshot.
 
 set -euo pipefail

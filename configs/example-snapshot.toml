@@ -1,9 +1,9 @@
 # Example snapshot.toml, for reference only (install.sh doesn't install it).
-# snap.py capture writes one into each snapshot directory,
+# molt.py capture writes one into each snapshot directory,
 # captures/YYYY/MM-DD/<snapshot id>/snapshot.toml; a restore reads it to verify the
 # archives and to find each archive's root and link.
 
-# Snapshot written by snap.py capture
+# Snapshot written by molt.py capture
 [tarball]
 # compress = "xz"      # Written only when not gzip
 rollback = ".bak"      # The capture config's rollback extension
