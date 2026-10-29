@@ -202,11 +202,13 @@ their managers.
   adopted. App Store apps install with mas, which brew installs first if needed; the App
   Store must be signed in, and an app must have been bought or claimed before. Homebrew
   won't run as root, so as root both are skipped.
-- `[[custom]]` commands run with bash. `check` exits 0 when the thing is installed. With
-  `items`, each item gets its own check and install, with `{item}` replaced by the item,
-  shell-quoted. A `list` command that prints the installed items, one per line, takes the
-  place of the checks, and lets `--status` show the ones not in the config. `requires`
-  names a command the entry needs; while it is missing, the entry is skipped.
+- `[[custom]]` commands run with bash. Without bash (a small Alpine, say) the entries
+  are skipped, and so are `[[manual]]` entries with a `check`. `check` exits 0 when the
+  thing is installed. With `items`, each item gets its own check and install, with
+  `{item}` replaced by the item, shell-quoted. A `list` command that prints the installed
+  items, one per line, takes the place of the checks, and lets `--status` show the ones
+  not in the config. `requires` names a command the entry needs; while it is missing,
+  the entry is skipped.
 - `[[manual]]` is for what no command should install: apps your device management pushes
   or offers in a self-service portal, or installers without a cask.
 

@@ -4939,3 +4939,96 @@ exit 0
 """)
     fake_tool(inst.bin, "apt-mark", "#!/bin/sh\nprintf 'bash\\nlibc6\\njq\\nlibjq1\\nvim\\n'\n")
     assert molt.AptGroup.requested() == ["jq", "vim"]
+
+
+def test_dnf4_keeps_only_the_leaves_rpm_finds(inst):
+    inst.on("linux", "fedora")
+    # dnf4 has no --leaves; every package a user asked for comes back
+    fake_tool(inst.bin, "dnf", r"""#!/bin/sh
+case "$*" in *--leaves*) echo "No such option: --leaves" >&2; exit 2;; esac
+printf '%s\n' bash glibc jq oniguruma vim-enhanced shell-user python3 python3.11 dnf
+""")
+    # Requires by name and by a path ('/bin/sh', only bash has it), and one that wants
+    # python(abi) = 3.9, which python3 provides and python3.11 (3.11) doesn't
+    fake_tool(inst.bin, "rpm", r"""#!/bin/sh
+row() { printf '%s\t' "$@" | sed 's/\t$//'; echo; }
+case "$3" in
+    # Without %{=NAME} rpm prints an error and exits 0, like the real one
+    '[%{NAME}'*) echo 'error: incorrect format: array iterator used' >&2;;
+    *REQUIRENAME*)
+        row bash libc.so.6 '' ''; row jq libonig.so.5 '' ''; row jq libc.so.6 '>=' 2
+        row vim-enhanced vim-common '' ''; row shell-user /bin/sh '' ''
+        row glibc glibc-common = 2.34; row oniguruma 'rpmlib(PayloadIsZstd)' '<=' 5
+        row dnf 'python(abi)' = 3.9;;
+    *PROVIDENAME*)
+        row glibc libc.so.6 ''; row oniguruma libonig.so.5 ''; row jq jq 1.7-1
+        row bash bash 5.2-1; row python3 'python(abi)' 3.9
+        row python3.11 'python(abi)' 3.11;;
+    *FILENAMES*) row bash /bin/sh; row bash /bin/bash; row jq /usr/bin/jq;;
+esac
+""")
+    assert molt.DnfGroup.requested() == [
+        "jq", "vim-enhanced", "shell-user", "python3.11", "dnf",
+    ]
+
+
+@pytest.mark.parametrize("wanted, have, matches", [
+    ("3.9", "3.9", True),
+    ("3.9", "3.11", False),
+    ("4.14.0", "4.14.0-1.amzn2023", True),
+    ("4.14.0-1", "4.14.0-2", False),
+    ("1:2.0-1", "2.0-1", True),
+    ("3.9", "3.9.25-1", False),
+])
+def test_rpm_version_matches(wanted, have, matches):
+    assert molt.rpm_version_matches(wanted, have) is matches
+
+
+def test_dnf5_lists_its_own_leaves(inst):
+    inst.on("linux", "fedora")
+    fake_tool(inst.bin, "dnf", "#!/bin/sh\nprintf 'jq\\ntree\\n'\n")
+    fake_tool(inst.bin, "rpm", "#!/bin/sh\nexit 1\n")  # not needed
+    assert molt.DnfGroup.requested() == ["jq", "tree"]
+
+
+def test_shell_line_keeps_a_format_string_on_one_line():
+    argv = ["dpkg-query", "-W", "-f", "${Status}\t${Package}\n", "it's"]
+    assert molt.shell_line(argv) == (
+        "dpkg-query -W -f $'${Status}\\t${Package}\\n' 'it'\"'\"'s'"
+    )
+    assert molt.shell_line(["printf", "a'b\\c\x01\n"]) == "printf $'a\\'b\\\\c\\x01\\n'"
+
+
+def test_verbose_queries_show_under_their_group(inst, capfd, monkeypatch):
+    inst.on("linux", "ubuntu", "debian")
+    fake_apt(inst, installed=["jq"])
+    inst.config(
+        '[apt]\npackages = ["jq"]\n\n'
+        '[[custom]]\nname = "marker"\ncheck = "true"\ninstall = "true"\n'
+    )
+    assert inst.run("--verbose") == 0
+    out = capfd.readouterr().out.splitlines()
+    query = "  run: dpkg-query -W -f $'${db:Status-Abbrev}\\t${Package}\\n'"
+    assert query in out
+    assert out.index("Checking apt...") < out.index(query)
+    check = "  run: bash -c true"
+    assert out.index("Checking marker...") == out.index(check) - 1
+    assert "Skipping marker (1 item already installed)" in out
+
+
+def test_custom_and_manual_checks_are_skipped_without_bash(inst, capfd):
+    inst.on("linux", "alpine")
+    (inst.tmp / "tools" / "bash").unlink()
+    inst.config(
+        '[[custom]]\nname = "marker"\ncheck = "test -f x"\ninstall = "touch x"\n\n'
+        '[[manual]]\nname = "VPN"\ncheck = "command -v openconnect"\n'
+    )
+    assert inst.run() == 0
+    captured = capfd.readouterr()
+    out = captured.out.splitlines()
+    assert "Skipping marker (bash not found; 1 item not installed)" in out
+    assert "Skipping manual (bash not found; 1 item not checked)" in out
+    assert out[-1] == "Install completed: 0 items installed, 2 skipped"
+    assert captured.err == ""
+    assert inst.run("--status") == 0
+    assert "Skipping marker (bash not found; 1 item not checked)" in capfd.readouterr().out

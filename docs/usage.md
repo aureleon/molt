@@ -385,6 +385,9 @@ only parts on Linux (App Store apps, casks, and `[[manual]]` apps in `/Applicati
 The system package managers run as root: directly when molt runs as root (in a
 container, say), else through sudo. Homebrew refuses to run as root, so as root its
 sections are skipped. Flatpak apps install for your user by default, without root.
+Flatpak needs D-Bus, which every desktop runs: on a server or in a container without a
+system bus (`/run/dbus/system_bus_socket`), `flatpak install` fails with "Could not
+connect".
 
 Installers can prompt (a sudo password, an App Store sign-in, a `curl | sh` installer),
 so install commands run on the terminal, and their output is not indented. Without a
@@ -397,9 +400,9 @@ before a new shell has added it to `PATH`.
 `--status` changes nothing. Per section, it shows how many items are installed, each
 missing one, and what that tool has installed that the config doesn't list: formulae
 installed on request, casks, global npm packages, and for system packages the ones that
-were asked for and that nothing else depends on (with apt and dnf5; dnf4 can't tell, so
-it lists every package a user installed). A section the config leaves out is shown only
-when its tool has installed something.
+were asked for and that nothing else depends on (on Fedora and RHEL, the base system a
+cloud or container image was built with counts as asked for). A section the config
+leaves out is shown only when its tool has installed something.
 
 `--draft FILE` writes a config of what this machine has installed, from the same lists:
 system packages, taps, formulae and casks, App Store apps (by their Spotlight ids, so

@@ -178,7 +178,8 @@ prune deletes only after a `[y/N]` prompt (or `--yes`), never with sudo.
 
 - Every function that changes anything checks `__dry_run__` and changes nothing.
 - `emit()` prefixes every line with `[DRY-RUN]` (through `printd`); don't call `printd`.
-- A skipped command is shown with `echo(argv)` (`run: <shlex.join(argv)>`), once.
+- A skipped command is shown with `echo(argv)` (`run: <shell_line(argv)>`, which is
+  `shlex.join` with `$'...'` for arguments holding a tab or newline), once.
 - Paths a real run would create use the stand-ins (`DRY_RUN_DIR`, `DRY_RUN_CHECKSUM`,
   ...) and are displayed with `shown()` (`<staging dir>`, `<checksum>`).
 - Work a dry run can't preview gets a `note()`; read-only queries of hosts still run.

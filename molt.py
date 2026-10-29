@@ -76,6 +76,8 @@ def printd(*args, **kwargs):
 
 INDENT = "  "
 BAR_FORMAT = "  {desc}: {n}/{total} [{elapsed}]"
+# How shell_line() writes control characters in a $'...' word
+SHELL_ESCAPES = {"\n": "\\n", "\t": "\\t", "\r": "\\r"}
 
 # Dry-run stand-ins for paths and values a real run would create
 DRY_RUN_DIR = "/tmp/dry-run"
@@ -249,6 +251,28 @@ def say(msg, level=1):
     emit(msg, level)
 
 
+def shell_line(argv):
+    """Join argv into one shell line. An argument with a control character (a tab or
+    newline in a query's format string) is written $'...', so the line stays one line."""
+    words = []
+    for arg in argv:
+        if not any(ord(c) < 32 or c == "\x7f" for c in arg):
+            words.append(shlex.quote(arg))
+            continue
+        escaped = ""
+        for c in arg:
+            if c in "\\'":
+                escaped += "\\" + c
+            elif c in SHELL_ESCAPES:
+                escaped += SHELL_ESCAPES[c]
+            elif ord(c) < 32 or c == "\x7f":
+                escaped += f"\\x{ord(c):02x}"
+            else:
+                escaped += c
+        words.append(f"$'{escaped}'")
+    return " ".join(words)
+
+
 def echo(argv, level=1, verbose=False, runs=False):
     """Show a command as 'run: <shell line>'.
 
@@ -257,7 +281,7 @@ def echo(argv, level=1, verbose=False, runs=False):
     """
     skipped = __dry_run__ and not runs
     if skipped or (verbose and __verbose__):
-        emit("run: " + shlex.join(shown(arg) for arg in argv), level)
+        emit("run: " + shell_line(shown(arg) for arg in argv), level)
 
 
 def ok(msg, level=1, dry=None):
@@ -4322,7 +4346,7 @@ def install_commands(argvs):
     for argv in argvs:
         code = install_run(argv)
         if code != 0:
-            failures.append(f"{shlex.join(argv)}: exit status {code}")
+            failures.append(f"{shell_line(argv)}: exit status {code}")
     return failures
 
 
@@ -4792,17 +4816,74 @@ class AptGroup(SystemGroup):
         return argvs
 
 
+def rpm_version_matches(wanted, have):
+    """Check if a provided version meets an '= wanted' requirement: the same version, or,
+    when wanted has no release, any release of it. Epochs ('1:') are left out."""
+    wanted = re.sub(r"^\d+:", "", wanted)
+    have = re.sub(r"^\d+:", "", have)
+    return have == wanted or ("-" not in wanted and have.startswith(wanted + "-"))
+
+
+def rpm_leaves(names):
+    """Keep the packages no other installed package requires, like dnf5's --leaves, for
+    dnf4. A requirement is matched to the packages that provide it, or for a path
+    ('/bin/sh') to the packages that have that file. names is returned as it is when rpm
+    can't answer."""
+
+    def rows(tags):
+        # %{=NAME} repeats the name on each line of the array; rpm exits 0 on a bad format
+        fields = "\t".join(f"%{{{tag}}}" for tag in tags)
+        argv = ["rpm", "-qa", "--queryformat", f"[%{{=NAME}}\t{fields}\n]"]
+        out = install_query(argv, "", quiet=True)
+        if out is None:
+            return None
+        return [line.split("\t") for line in out.splitlines()
+                if line.count("\t") == len(tags)]
+
+    requires = rows(["REQUIRENAME", "REQUIREFLAGS:depflags", "REQUIREVERSION"])
+    provides = rows(["PROVIDENAME", "PROVIDEVERSION"])
+    if requires is None or provides is None:
+        return names
+    paths = {need for _, need, _, _ in requires if need.startswith("/")}
+    if paths:
+        files = rows(["FILENAMES"])
+        if files is None:
+            return names
+        provides += [[package, path, ""] for package, path in files if path in paths]
+    owners = {}
+    for package, capability, version in provides:
+        owners.setdefault(capability, []).append((package, version))
+    needed = set()
+    for package, need, flags, version in requires:
+        for owner, have in owners.get(need, ()):
+            # '= 3.9' picks one of several (python(abi) of python3 and python3.11); any
+            # other requirement counts every provider
+            if owner != package and (flags.strip() != "=" or rpm_version_matches(version, have)):
+                needed.add(owner)
+    return [name for name in names if name not in needed]
+
+
 class DnfGroup(SystemGroup):
     """[dnf]: Fedora, RHEL and Amazon Linux packages."""
 
     section = "dnf"
     tool = "dnf"
     installed_argv = ("rpm", "-qa", "--queryformat", "%{NAME}\n")
-    # dnf5 can list only the leaves; dnf4 can't, and lists every package a user asked for
+    # dnf5 lists the leaves itself; dnf4 has no --leaves, so rpm_leaves() keeps them
     requested_argvs = [
         ("dnf", "repoquery", "--userinstalled", "--leaves", "--queryformat", "%{name}\n"),
-        ("dnf", "repoquery", "--userinstalled", "--queryformat", "%{name}\n"),
     ]
+    userinstalled_argv = ("dnf", "repoquery", "--userinstalled", "--queryformat", "%{name}\n")
+
+    @classmethod
+    def requested(cls):
+        names = super().requested()
+        if names is not None:
+            return names
+        out = install_query(list(cls.userinstalled_argv), "", quiet=True)
+        if out is None:
+            return None
+        return rpm_leaves(install_lines(out))
 
     def install_argvs(self, names):
         return [as_root(["dnf", "install", "-y", *names])]
@@ -5272,6 +5353,8 @@ class CustomGroup(InstallGroup):
         self.scope = f"custom:{name}"
 
     def unavailable(self):
+        if not install_which("bash"):
+            return "bash not found"
         requires = self.table.get("requires")
         if requires and not install_which(requires):
             return f"{requires} not found"
@@ -5349,6 +5432,13 @@ class ManualGroup(InstallGroup):
 
     def items(self):
         return [InstallItem(e["name"], f"'{e['name']}'", e) for e in self.entries]
+
+    def unavailable(self):
+        # A 'check' runs with bash, which a small Linux (Alpine) may not have
+        checks = any(not entry.get("app") for entry in self.entries)
+        if checks and not install_which("bash"):
+            return "bash not found"
+        return None
 
     def present(self):
         installed = []
@@ -5538,9 +5628,11 @@ def install_status(groups, config_name):
                 step_skipped(group.title, f"{reason}; {plural(len(items), 'item')} not checked")
                 skipped += len(items)
             continue
-        # A section the config leaves out shows only when its tool installed something
-        if items:
-            step(f"Checking {group.title}")
+        # A section the config leaves out shows only when its tool installed something,
+        # or with --verbose, which shows its queries
+        unlisted = " (not in the config)" if not items else ""
+        if items or __verbose__:
+            step(f"Checking {group.title}{unlisted}")
         state = group.present()
         if state is None:
             continue
@@ -5552,7 +5644,8 @@ def install_status(groups, config_name):
         if not items:
             if not extra:
                 continue
-            step(f"Checking {group.title} (not in the config)")
+            if not __verbose__:
+                step(f"Checking {group.title}{unlisted}")
         missing = [item for item in items if item.key not in state.installed]
         if items:
             say(f"installed: {len(items) - len(missing)} of {len(items)}")
@@ -5595,9 +5688,14 @@ def install_all(groups, config_name):
             continue
         reason = group.unavailable()
         if reason:
-            step_skipped(group.title, f"{reason}; {plural(len(items), 'item')} not installed")
+            # [[manual]] entries are only ever checked
+            done = "checked" if group.section == "manual" else "installed"
+            step_skipped(group.title, f"{reason}; {plural(len(items), 'item')} not {done}")
             skipped += len(items)
             continue
+        # With --verbose the queries show; this puts them under their group's name
+        if __verbose__:
+            step(f"Checking {group.title}")
         state = group.present()
         if state is None:
             continue
