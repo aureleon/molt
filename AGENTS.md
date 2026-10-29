@@ -71,19 +71,24 @@ prune deletes only after a `[y/N]` prompt (or `--yes`), never with sudo.
 
 **check** prints `name: checksum` lines; those stdout lines are a stable format.
 
-**install** (`cmd_install`, local molt root only, never as root):
-1. `install_groups` builds and verifies one `InstallGroup` per section of install.toml,
-   in `install_order` (`[install] order`, then `INSTALL_SECTIONS`); each `[[custom]]`
-   entry is its own group. A built-in section the config leaves out gets an empty group,
-   so `--status` can show what its tool installed.
-2. Per group: `unavailable()` (its tool is missing: skipped), `items()`, `present()`
-   (read-only queries, which run in a dry run too), then `install(missing)` and
-   `present()` again; what is still missing is one Error. `[[manual]]` is only checked.
+**install** (`cmd_install`, local molt root only):
+1. `install_groups` builds and verifies one `InstallGroup` per table of install.toml
+   (`[brew]`, or each `[[brew]]`), in `install_order` (`[install] order`, then
+   `INSTALL_SECTIONS`); each `[[custom]]` entry is its own group. A built-in section the
+   config leaves out gets an empty group, so `--status` can show what its tool installed.
+2. Per group: `wrong_os()` (its `platforms` or `os` key leave out `install_os()`, or a
+   `SystemGroup`'s package manager is missing: left out, shown only with --verbose),
+   `unavailable()` (its tool is missing, or Homebrew as root: skipped), `items()`,
+   `present()` (read-only queries, which run in a dry run too), then `install(missing)`
+   and `present()` again; what is still missing is one Error. `[[manual]]` is only
+   checked. System package managers run through `as_root()` (sudo unless root).
+   `--status` lists `InstallState.found` keys that no group of the same `scope` asks for.
 3. `--status` (`install_status`) and `--brewfile` (`brewfile_text`) change nothing;
    `--draft` (`install_draft_text`) builds a config from each group class's `draft()`.
    capture's `[install] draft = true` writes one into the snapshot (`install_draft_write`).
 4. A new package manager is an `InstallGroup` subclass (`NamesGroup` for a plain array
-   of names), a name in `INSTALL_SECTIONS`, and an entry in `INSTALL_GROUPS`.
+   of names, `SystemGroup` for a Linux one run as root), a name in `INSTALL_SECTIONS`,
+   and an entry in `INSTALL_GROUPS`.
 
 ## Remote model
 
@@ -107,8 +112,10 @@ prune deletes only after a `[y/N]` prompt (or `--yes`), never with sudo.
 - Try things in `mktemp -d` dirs with `HOME=<tmp>/home`, a molt root there, and
   `-r <tmp>/root`. Never touch `~/.molt` or real dotfiles.
 - Never run `molt install` without `--dry-run` or `--status` outside a temp HOME with
-  fake tools: it installs for real. Its tests (the `inst` fixture) put fakes first on
-  `PATH` and empty `INSTALL_PATH_DIRS`, so the real brew in /opt/homebrew is never found.
+  fake tools: it installs for real. Its tests (the `inst` fixture) set `PATH` to the fakes
+  plus links to a few plain commands, empty `INSTALL_PATH_DIRS`, and fix `install_os()`
+  (`inst.on("linux", ...)`), so no real package manager is ever found. Real Linux runs
+  go in throwaway containers only.
 - Never use real sudo, never contact real hosts. The tests put fake `sudo`, `ssh`,
   `rsync` and `age` first on `PATH` (see the `env` and `hosts` fixtures); do the same
   for manual runs.

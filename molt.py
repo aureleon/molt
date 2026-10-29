@@ -4081,10 +4081,16 @@ def prune_delete(captures_dir, snapshots, backups):
 # --- Install Logic --- #
 
 # The sections of install.toml, in the order they install unless [install] order sets
-# another. Homebrew goes first, since it installs most other tools; custom goes before
-# the language tools, so its commands can install their managers (rustup, uv); manual
-# goes last, as the list of what is left to install by hand
-INSTALL_SECTIONS = ["brew", "mas", "custom", "mise", "npm", "cargo", "uv", "vscode", "manual"]
+# another. The system package managers go first, since on Linux they install what Homebrew
+# and the language tools build with (curl, git, a compiler). Homebrew goes next, as it
+# installs most other tools; custom goes before the language tools, so its commands can
+# install their managers (rustup, uv); manual goes last, as the list of what is left to
+# install by hand
+INSTALL_SECTIONS = [
+    "apt", "dnf", "pacman", "zypper", "apk",
+    "brew", "mas", "flatpak", "snapd",
+    "custom", "mise", "npm", "cargo", "uv", "vscode", "manual",
+]
 
 # Where package managers put their commands on a new machine, before a shell has put them
 # on PATH. Install commands get the ones that exist after PATH's own entries, so a tool
@@ -4092,8 +4098,11 @@ INSTALL_SECTIONS = ["brew", "mas", "custom", "mise", "npm", "cargo", "uv", "vsco
 INSTALL_PATH_DIRS = [
     "/opt/homebrew/bin",
     "/usr/local/bin",
+    "/home/linuxbrew/.linuxbrew/bin",
+    "~/.linuxbrew/bin",
     "~/.cargo/bin",
     "~/.local/bin",
+    "/snap/bin",
     "/Applications/Visual Studio Code.app/Contents/Resources/app/bin",
 ]
 
@@ -4110,8 +4119,64 @@ INSTALL_APP_DIRS = ["/Applications", "~/Applications"]
 BREW_DEFAULT_TAPS = {"homebrew/core", "homebrew/cask"}
 NPM_BUNDLED = {"npm", "corepack"}
 
+# The remote [flatpak] installs from by default, and where it is added from when missing
+FLATHUB = "flathub"
+FLATHUB_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
+
+# Snaps that come with snapd itself (snap list marks them in its Notes column)
+SNAPD_BASE_NOTES = {"base", "core", "snapd"}
+
 # The file a draft is written to in a snapshot, with 'draft = true' in capture.toml
 DRAFT_INSTALL_TOML = "install.toml"
+
+# install_os() result, read once per run
+_install_os = {}
+
+
+def install_os():
+    """Name this system for 'os' keys: 'macos' (or 'darwin'), or 'linux' plus the
+    distro's ID and ID_LIKE from os-release ('ubuntu', 'debian'). Any other system is
+    named by platform.system() ('freebsd')."""
+    if "names" in _install_os:
+        return _install_os["names"]
+    system = platform.system()
+    if system == "Darwin":
+        names = {"macos", "darwin"}
+    else:
+        names = {system.lower()}
+        if system == "Linux":
+            try:
+                release = platform.freedesktop_os_release()
+            except OSError:
+                release = {}
+            for key in ("ID", "ID_LIKE"):
+                names |= set(release.get(key, "").lower().split())
+    _install_os["names"] = names
+    return names
+
+
+def os_mismatch(wanted):
+    """Return why a list of system names leaves this machine out, or None if it doesn't."""
+    if not wanted or set(wanted) & install_os():
+        return None
+    return f"for {' or '.join(wanted)} only"
+
+
+def install_os_list(table, where, config_name):
+    """Return a table's 'os' key as a list of lowercase names (empty: every system)."""
+    value = table.get("os")
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not value or not all(
+        isinstance(name, str) and name.strip() for name in value
+    ):
+        fatal(
+            f"{config_name}: the 'os' key in {where} must be a system name or an array of them",
+            'For example: os = "linux", or os = ["macos", "ubuntu"]',
+        )
+    return [name.strip().lower() for name in value]
 
 
 class InstallItem:
@@ -4124,11 +4189,12 @@ class InstallItem:
 
 
 class InstallState:
-    """What is installed of a group: the installed keys, and labels of what isn't in the config."""
+    """What a group found: the installed keys, and {key: label} of what a status lists as
+    not in the config when no group of the same scope asks for it."""
 
-    def __init__(self, installed, extra=()):
+    def __init__(self, installed, found=None):
         self.installed = set(installed)
-        self.extra = list(extra)
+        self.found = dict(found or {})
 
 
 def install_env():
@@ -4146,12 +4212,30 @@ def install_which(tool):
     return shutil.which(tool, path=install_env()["PATH"])
 
 
-def install_query(argv, what, any_status=False):
+def is_root():
+    """Check if this runs as root."""
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def as_root(argv):
+    """Return argv to run as root: as it is when this is root, else through sudo."""
+    return list(argv) if is_root() else ["sudo", *argv]
+
+
+def root_unavailable():
+    """Return why a command can't run as root here (not root, and no sudo), or None."""
+    if is_root() or install_which("sudo"):
+        return None
+    return "not root, and sudo not found"
+
+
+def install_query(argv, what, any_status=False, quiet=False):
     """Run a read-only command and return its stdout, or None after an Error line.
 
     Queries change nothing, so they run in a dry run too. what names the query in the
     Error line ('list the Homebrew casks'). any_status accepts any exit status, for
-    tools that exit 1 with a usable answer (npm ls with extraneous packages).
+    tools that exit 1 with a usable answer (npm ls with extraneous packages). quiet
+    returns None without an Error line, for answers that are only nice to have.
     """
     echo(argv, 1, verbose=True, runs=True)
     try:
@@ -4164,14 +4248,17 @@ def install_query(argv, what, any_status=False):
             timeout=COMMAND_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        error(f"Cannot {what}: {argv[0]} timed out after {COMMAND_TIMEOUT}s")
+        if not quiet:
+            error(f"Cannot {what}: {argv[0]} timed out after {COMMAND_TIMEOUT}s")
         return None
     except OSError as e:
-        error(f"Cannot {what}: {e.strerror or e}")
+        if not quiet:
+            error(f"Cannot {what}: {e.strerror or e}")
         return None
     if result.returncode != 0 and not any_status:
-        relay(result.stderr, 1, sys.stderr)
-        error(f"Cannot {what} ({Path(argv[0]).name} exit status {result.returncode})")
+        if not quiet:
+            relay(result.stderr, 1, sys.stderr)
+            error(f"Cannot {what} ({Path(argv[0]).name} exit status {result.returncode})")
         return None
     return result.stdout
 
@@ -4205,10 +4292,10 @@ def install_check(command):
 def install_run(argv):
     """Run one install command on the terminal; return its exit status.
 
-    Installers ask for things (a sudo password for a cask's pkg, an App Store sign-in, a
-    'curl | sh' installer's questions), so the command keeps the terminal, as the sudo
-    re-run does. Without a terminal its stdin is /dev/null, so a prompt fails instead of
-    waiting. A dry run only shows the command.
+    Installers ask for things (a sudo password, an App Store sign-in, a 'curl | sh'
+    installer's questions), so the command keeps the terminal, as the sudo re-run does.
+    Without a terminal its stdin is /dev/null, so a prompt fails instead of waiting. A
+    dry run only shows the command.
     """
     echo(argv, 1, verbose=True)
     if __dry_run__:
@@ -4229,11 +4316,29 @@ def install_run(argv):
     return result.returncode
 
 
+def install_commands(argvs):
+    """Run install commands in order; return a failure detail for each one that failed."""
+    failures = []
+    for argv in argvs:
+        code = install_run(argv)
+        if code != 0:
+            failures.append(f"{shlex.join(argv)}: exit status {code}")
+    return failures
+
+
 def install_names(table, key, where, config_name):
     """Return the array of names at table[key] (default empty), or stop on a bad one."""
     value = table.get(key, [])
     if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
         fatal(f"{config_name}: the '{key}' key in {where} must be an array of names")
+    return value
+
+
+def install_bool(table, key, default, where, config_name):
+    """Return table[key] as true or false (default when missing), or stop on another value."""
+    value = table.get(key, default)
+    if not isinstance(value, bool):
+        fatal(f"{config_name}: the '{key}' key in {where} must be true or false")
     return value
 
 
@@ -4346,33 +4451,34 @@ def brew_bundle(lines):
     return [] if code == 0 else [f"brew bundle exit status {code}"]
 
 
-def install_commands(argvs):
-    """Run install commands in order; return a failure detail for each one that failed."""
-    failures = []
-    for argv in argvs:
-        code = install_run(argv)
-        if code != 0:
-            failures.append(f"{shlex.join(argv)}: exit status {code}")
-    return failures
-
-
 class InstallGroup:
-    """A unit of install.toml that installs together: a built-in section, or one [[custom]].
+    """A unit of install.toml that installs together: one table of a built-in section
+    ([brew], or each [[brew]]), or one [[custom]] entry.
 
     A subclass lists its items, reports what is installed, and installs the rest. A new
     package manager is a subclass with a section name in INSTALL_SECTIONS and an entry
-    in INSTALL_GROUPS; draft() lets 'install --draft' fill its section in.
+    in INSTALL_GROUPS; draft() lets 'install --draft' fill its section in. platforms
+    names the systems a section works on at all; every table can narrow that with 'os'.
     """
 
     section = ""
     tool = None
     keys = ()
+    platforms = ()
 
-    def __init__(self, table, config_name):
+    def __init__(self, table, config_name, where=None):
         self.table = table
         self.config_name = config_name
-        self.title = self.section
-        install_keys(table, self.keys, f"[{self.section}]", config_name)
+        self.where = where or f"[{self.section}]"
+        install_keys(table, (*self.keys, "os"), self.where, config_name)
+        self.os = install_os_list(table, self.where, config_name)
+        self.title = self.section + (f" ({', '.join(self.os)})" if self.os else "")
+        # Groups of one scope share what a status lists as not in the config
+        self.scope = self.section
+
+    def wrong_os(self):
+        """Return why this group is for other systems, or None."""
+        return os_mismatch(self.platforms) or os_mismatch(self.os)
 
     def unavailable(self):
         """Return why this group can't run here (its tool is missing), or None."""
@@ -4381,8 +4487,16 @@ class InstallGroup:
         return None
 
     def items(self):
-        """Return the InstallItems the config lists."""
+        """Return the InstallItems the config lists for this system."""
         return []
+
+    def notes(self):
+        """Return the items left out on this system, as 'skip:' details."""
+        return []
+
+    def extra_keys(self):
+        """Return the keys a status shouldn't list as not in the config."""
+        return {item.key for item in self.items()}
 
     def present(self):
         """Return an InstallState, or None after an Error line."""
@@ -4404,11 +4518,12 @@ class NamesGroup(InstallGroup):
     names_key = ""
     case_blind = False
 
-    def key(self, name):
-        return name.lower() if self.case_blind else name
+    @classmethod
+    def key(cls, name):
+        return name.lower() if cls.case_blind else name
 
     def items(self):
-        names = install_names(self.table, self.names_key, f"[{self.section}]", self.config_name)
+        names = install_names(self.table, self.names_key, self.where, self.config_name)
         return [InstallItem(self.key(name), f"'{name}'", name) for name in names]
 
     def listed(self):
@@ -4419,14 +4534,13 @@ class NamesGroup(InstallGroup):
         names = self.listed()
         if names is None:
             return None
-        wanted = {item.key for item in self.items()}
-        installed = {self.key(name) for name in names}
-        extra = [f"'{name}'" for name in names if self.key(name) not in wanted]
-        return InstallState(installed, extra)
+        found = {self.key(name): f"'{name}'" for name in names}
+        return InstallState(found, found)
 
 
 class BrewGroup(InstallGroup):
-    """[brew]: taps, formulae and casks, installed with 'brew bundle'."""
+    """[brew]: taps, formulae and casks, installed with 'brew bundle'. Casks are macOS only,
+    so on Linux they are left out."""
 
     section = "brew"
     tool = "brew"
@@ -4435,14 +4549,29 @@ class BrewGroup(InstallGroup):
     # Config key, label, Brewfile keyword
     KINDS = [("taps", "tap", "tap"), ("formulae", "formula", "brew"), ("casks", "cask", "cask")]
 
-    def items(self):
+    def unavailable(self):
+        if is_root():
+            return "Homebrew can't run as root"
+        return super().unavailable()
+
+    def all_items(self):
         items = []
         for key, kind, keyword in self.KINDS:
-            for name in install_names(self.table, key, "[brew]", self.config_name):
+            for name in install_names(self.table, key, self.where, self.config_name):
                 ident = name.lower() if kind == "tap" else brew_short(name)
                 line = f"{keyword} {ruby_string(name)}"
                 items.append(InstallItem(f"{kind}:{ident}", f"{kind} '{name}'", line))
         return items
+
+    def items(self):
+        casks = "macos" in install_os()
+        return [item for item in self.all_items() if casks or not item.key.startswith("cask:")]
+
+    def notes(self):
+        if "macos" in install_os():
+            return []
+        return [f"{item.label} (macOS only)" for item in self.all_items()
+                if item.key.startswith("cask:")]
 
     @staticmethod
     def query():
@@ -4450,13 +4579,15 @@ class BrewGroup(InstallGroup):
         queries = [
             (["brew", "tap"], "list the Homebrew taps"),
             (["brew", "list", "--formula", "-1"], "list the Homebrew formulae"),
-            (["brew", "list", "--cask", "-1"], "list the Homebrew casks"),
             (["brew", "leaves", "--installed-on-request"], "list the Homebrew leaves"),
         ]
+        if "macos" in install_os():
+            queries.append((["brew", "list", "--cask", "-1"], "list the Homebrew casks"))
         outputs = [install_query(argv, what) for argv, what in queries]
         if any(out is None for out in outputs):
             return None
-        return [install_lines(out) for out in outputs]
+        taps, formulae, leaves, *casks = [install_lines(out) for out in outputs]
+        return taps, formulae, casks[0] if casks else [], leaves
 
     def present(self):
         found = self.query()
@@ -4467,29 +4598,29 @@ class BrewGroup(InstallGroup):
         installed |= {f"formula:{brew_short(name)}" for name in formulae}
         installed |= {f"cask:{brew_short(name)}" for name in casks}
 
-        # Not in the config: taps of its own, formulae installed on request, and casks
-        wanted = {item.key for item in self.items()}
-        extra = [f"tap '{tap}'" for tap in taps
-                 if tap.lower() not in BREW_DEFAULT_TAPS and f"tap:{tap.lower()}" not in wanted]
-        extra += [f"formula '{name}'" for name in leaves
-                  if f"formula:{brew_short(name)}" not in wanted]
-        extra += [f"cask '{name}'" for name in casks if f"cask:{brew_short(name)}" not in wanted]
-        return InstallState(installed, extra)
+        # What a status may list: taps of its own, formulae installed on request, and casks
+        listed = {f"tap:{tap.lower()}": f"tap '{tap}'" for tap in taps
+                  if tap.lower() not in BREW_DEFAULT_TAPS}
+        listed |= {f"formula:{brew_short(name)}": f"formula '{name}'" for name in leaves}
+        listed |= {f"cask:{brew_short(name)}": f"cask '{name}'" for name in casks}
+        return InstallState(installed, listed)
 
     def install(self, missing):
         return brew_bundle([item.value for item in missing])
 
     @staticmethod
     def draft():
-        found = BrewGroup.query() if install_which("brew") else None
+        found = BrewGroup.query() if install_which("brew") and not is_root() else None
         if found is None:
             return None
         taps, _, casks, leaves = found
-        return {
+        table = {
             "taps": [tap for tap in taps if tap.lower() not in BREW_DEFAULT_TAPS],
             "formulae": leaves,
-            "casks": casks,
         }
+        if casks:
+            table["casks"] = casks
+        return table
 
 
 class MasGroup(InstallGroup):
@@ -4503,6 +4634,12 @@ class MasGroup(InstallGroup):
     section = "mas"
     tool = "brew"
     keys = ("apps",)
+    platforms = ("macos",)
+
+    def unavailable(self):
+        if is_root():
+            return "Homebrew can't run as root"
+        return super().unavailable()
 
     def items(self):
         apps = self.table.get("apps", {})
@@ -4520,14 +4657,11 @@ class MasGroup(InstallGroup):
         ]
 
     def present(self):
-        apps = app_bundles()
-        ids = app_store_ids(apps)
+        ids = app_store_ids(app_bundles())
         installed = {f"mas:{app_id}" for app_id in ids.values()}
         installed |= {item.key for item in self.items() if app_find(item.value[0])}
-        wanted = {item.key for item in self.items()}
-        extra = [f"app '{app.stem}'" for app, app_id in ids.items()
-                 if f"mas:{app_id}" not in wanted]
-        return InstallState(installed, extra)
+        listed = {f"mas:{app_id}": f"app '{app.stem}'" for app, app_id in ids.items()}
+        return InstallState(installed, listed)
 
     def install(self, missing):
         lines = [] if install_which("mas") else ['brew "mas"']
@@ -4541,6 +4675,329 @@ class MasGroup(InstallGroup):
         if not ids:
             return None
         return {"apps": {app.stem: app_id for app, app_id in sorted(ids.items())}}
+
+
+class SystemGroup(NamesGroup):
+    """A Linux system package manager: packages installed as root (through sudo when this
+    isn't root). A subclass names its commands: one lists what is installed, and one
+    what was asked for, ideally only the leaves (what a status lists when it isn't in
+    the config, and what a draft lists), and the install."""
+
+    platforms = ("linux",)
+    keys = ("packages",)
+    names_key = "packages"
+    installed_argv = ()
+    # Commands that list what was asked for, the first that works answers; () when the
+    # tool can't tell
+    requested_argvs = ()
+
+    def wrong_os(self):
+        # Without its package manager this is another distro, not a tool still to install
+        reason = super().wrong_os()
+        if not reason and not install_which(self.tool):
+            reason = f"for systems with {self.tool}"
+        return reason
+
+    def unavailable(self):
+        return root_unavailable()
+
+    @staticmethod
+    def parse_installed(out):
+        return install_lines(out)
+
+    @staticmethod
+    def parse_requested(out):
+        return install_lines(out)
+
+    @classmethod
+    def requested(cls):
+        """Return the packages that were asked for, not pulled in, or None if unknown."""
+        for argv in cls.requested_argvs:
+            out = install_query(list(argv), "", quiet=True)
+            if out is not None:
+                return cls.parse_requested(out)
+        return None
+
+    def present(self):
+        out = install_query(list(self.installed_argv), f"list the {self.section} packages")
+        if out is None:
+            return None
+        installed = {self.key(name) for name in self.parse_installed(out)}
+        requested = self.requested() or []
+        return InstallState(installed, {self.key(name): f"'{name}'" for name in requested})
+
+    def install_argvs(self, names):
+        return []
+
+    def install(self, missing):
+        return install_commands(self.install_argvs([item.value for item in missing]))
+
+    @classmethod
+    def draft(cls):
+        if os_mismatch(cls.platforms) or not install_which(cls.tool):
+            return None
+        names = cls.requested()
+        return {"packages": names} if names else None
+
+
+class AptGroup(SystemGroup):
+    """[apt]: Debian and Ubuntu packages. 'apt-get update' runs first, unless update = false."""
+
+    section = "apt"
+    tool = "apt-get"
+    keys = ("packages", "update")
+    installed_argv = ("dpkg-query", "-W", "-f", "${db:Status-Abbrev}\t${Package}\n")
+    requested_argvs = [("apt-mark", "showmanual")]
+
+    def items(self):
+        install_bool(self.table, "update", True, self.where, self.config_name)
+        return super().items()
+
+    @staticmethod
+    def parse_installed(out):
+        # 'ii' is installed; 'rc' (removed, config kept) and the rest are not
+        return [line.split("\t", 1)[1].strip() for line in out.splitlines()
+                if line.startswith("ii") and "\t" in line]
+
+    @classmethod
+    def requested(cls):
+        # apt-mark counts the whole base system as asked for, so only the leaves are
+        # kept: packages no other installed one depends on (like 'brew leaves'), that
+        # aren't Essential or required/important (every Debian has those)
+        names = super().requested()
+        if names is None:
+            return None
+        fields = "${Package}\t${Essential}\t${Priority}\t${Depends}, ${Pre-Depends}\n"
+        out = install_query(["dpkg-query", "-W", "-f", fields], "", quiet=True) or ""
+        base, needed = set(), set()
+        for line in out.splitlines():
+            cells = line.split("\t")
+            if len(cells) != 4:
+                continue
+            if cells[1] == "yes" or cells[2] in ("required", "important"):
+                base.add(cells[0])
+            # 'libc6 (>= 2.34), python3:any | python3-minimal': every alternative counts
+            for dep in re.split(r"[,|]", cells[3]):
+                dep = dep.strip().split(" ", 1)[0].split(":", 1)[0]
+                if dep:
+                    needed.add(dep)
+        return [name for name in names if name not in base and name not in needed]
+
+    def install_argvs(self, names):
+        argvs = []
+        if self.table.get("update", True):
+            argvs.append(as_root(["apt-get", "update"]))
+        install = ["apt-get", "install", "-y", *names]
+        argvs.append(as_root(["env", "DEBIAN_FRONTEND=noninteractive", *install]))
+        return argvs
+
+
+class DnfGroup(SystemGroup):
+    """[dnf]: Fedora, RHEL and Amazon Linux packages."""
+
+    section = "dnf"
+    tool = "dnf"
+    installed_argv = ("rpm", "-qa", "--queryformat", "%{NAME}\n")
+    # dnf5 can list only the leaves; dnf4 can't, and lists every package a user asked for
+    requested_argvs = [
+        ("dnf", "repoquery", "--userinstalled", "--leaves", "--queryformat", "%{name}\n"),
+        ("dnf", "repoquery", "--userinstalled", "--queryformat", "%{name}\n"),
+    ]
+
+    def install_argvs(self, names):
+        return [as_root(["dnf", "install", "-y", *names])]
+
+
+class PacmanGroup(SystemGroup):
+    """[pacman]: Arch packages. update = true syncs and upgrades the system first
+    ('pacman -Syu'), since Arch doesn't support partial upgrades."""
+
+    section = "pacman"
+    tool = "pacman"
+    keys = ("packages", "update")
+    installed_argv = ("pacman", "-Qq")
+    requested_argvs = [("pacman", "-Qqet")]  # explicitly installed, and not required
+
+    def items(self):
+        install_bool(self.table, "update", False, self.where, self.config_name)
+        return super().items()
+
+    def install_argvs(self, names):
+        sync = "-Syu" if self.table.get("update", False) else "-S"
+        return [as_root(["pacman", sync, "--needed", "--noconfirm", *names])]
+
+
+class ZypperGroup(SystemGroup):
+    """[zypper]: openSUSE and SLES packages."""
+
+    section = "zypper"
+    tool = "zypper"
+    installed_argv = ("rpm", "-qa", "--queryformat", "%{NAME}\n")
+    requested_argvs = [("zypper", "--quiet", "packages", "--userinstalled")]
+
+    @staticmethod
+    def parse_requested(out):
+        # A table: 'i | repo | name | version | arch'; 'i' and 'i+' rows are installed
+        names = []
+        for line in out.splitlines():
+            cells = [cell.strip() for cell in line.split("|")]
+            if len(cells) >= 3 and cells[0] in ("i", "i+"):
+                names.append(cells[2])
+        return list(dict.fromkeys(names))
+
+    def install_argvs(self, names):
+        return [as_root(["zypper", "--non-interactive", "install", *names])]
+
+
+class ApkGroup(SystemGroup):
+    """[apk]: Alpine packages."""
+
+    section = "apk"
+    tool = "apk"
+    installed_argv = ("apk", "info")
+    requested_argvs = [("cat", "/etc/apk/world")]
+
+    @staticmethod
+    def parse_requested(out):
+        # /etc/apk/world has what was added, with any constraint: 'curl', 'py3-pip>=23'
+        return [re.split(r"[<>=~@]", line, maxsplit=1)[0] for line in install_lines(out)]
+
+    def install_argvs(self, names):
+        return [as_root(["apk", "add", *names])]
+
+
+class FlatpakGroup(NamesGroup):
+    """[flatpak]: Flatpak apps by id, from remote (default flathub, added when missing).
+    user = true (the default) installs them for this user, so no root is needed."""
+
+    section = "flatpak"
+    tool = "flatpak"
+    keys = ("apps", "remote", "user")
+    names_key = "apps"
+    platforms = ("linux",)
+
+    def items(self):
+        remote = self.table.get("remote", FLATHUB)
+        if not isinstance(remote, str) or not remote.strip():
+            fatal(f"{self.config_name}: the 'remote' key in {self.where} must be a remote name")
+        install_bool(self.table, "user", True, self.where, self.config_name)
+        return super().items()
+
+    def unavailable(self):
+        reason = super().unavailable()
+        if reason or self.table.get("user", True):
+            return reason
+        return root_unavailable()
+
+    @staticmethod
+    def listed_apps():
+        argv = ["flatpak", "list", "--app", "--columns=application"]
+        out = install_query(argv, "list the Flatpak apps")
+        return None if out is None else install_lines(out)
+
+    def listed(self):
+        return self.listed_apps()
+
+    def install(self, missing):
+        user = self.table.get("user", True)
+        where = "--user" if user else "--system"
+        run = list if user else as_root
+        remote = self.table.get("remote", FLATHUB)
+        argvs = []
+        if remote == FLATHUB:
+            argvs.append(run(["flatpak", "remote-add", "--if-not-exists", where, FLATHUB,
+                              FLATHUB_URL]))
+        ids = [item.value for item in missing]
+        argvs.append(run(["flatpak", "install", where, "-y", "--noninteractive", remote, *ids]))
+        return install_commands(argvs)
+
+    @staticmethod
+    def draft():
+        if os_mismatch(("linux",)) or not install_which("flatpak"):
+            return None
+        apps = FlatpakGroup.listed_apps()
+        return {"apps": apps} if apps else None
+
+
+def snapd_command():
+    """Find snapd's snap command, but not an older molt installed as 'snap'."""
+    path = install_which("snap")
+    if not path or Path(path).resolve() == __script__:
+        return None
+    try:
+        with open(path, "rb") as f:
+            if b"Snapshot and restore utility" in f.read(512):
+                return None
+    except OSError:
+        return None
+    return path
+
+
+class SnapdGroup(NamesGroup):
+    """[snapd]: snaps from the Snap Store, installed with snapd as root. classic lists the
+    snaps that need --classic confinement."""
+
+    section = "snapd"
+    keys = ("packages", "classic")
+    names_key = "packages"
+    platforms = ("linux",)
+
+    def unavailable(self):
+        if not snapd_command():
+            return "snapd not found"
+        return root_unavailable()
+
+    def items(self):
+        classic = install_names(self.table, "classic", self.where, self.config_name)
+        items = super().items()
+        return items + [InstallItem(name, f"'{name}' (classic)", name) for name in classic]
+
+    @staticmethod
+    def snaps():
+        """Return {name: notes} of the installed snaps, or None after an Error line."""
+        out = install_query([snapd_command(), "list"], "list the snaps")
+        if out is None:
+            return None
+        snaps = {}
+        for line in out.splitlines()[1:]:
+            cells = line.split()
+            if cells:
+                snaps[cells[0]] = cells[-1] if len(cells) >= 6 else ""
+        return snaps
+
+    def present(self):
+        snaps = self.snaps()
+        if snaps is None:
+            return None
+        listed = {name: f"'{name}'" for name, notes in snaps.items()
+                  if not set(notes.split(",")) & SNAPD_BASE_NOTES}
+        return InstallState(snaps, listed)
+
+    def install(self, missing):
+        command = snapd_command()
+        classic = set(install_names(self.table, "classic", self.where, self.config_name))
+        plain = [item.value for item in missing if item.value not in classic]
+        argvs = [as_root([command, "install", *plain])] if plain else []
+        # One --classic snap per command: snap won't take several with it
+        argvs += [as_root([command, "install", "--classic", item.value])
+                  for item in missing if item.value in classic]
+        return install_commands(argvs)
+
+    @staticmethod
+    def draft():
+        if os_mismatch(("linux",)) or not snapd_command():
+            return None
+        snaps = SnapdGroup.snaps() or {}
+        mine = {name: notes for name, notes in snaps.items()
+                if not set(notes.split(",")) & SNAPD_BASE_NOTES}
+        table = {}
+        plain = [name for name, notes in mine.items() if "classic" not in notes.split(",")]
+        classic = [name for name, notes in mine.items() if "classic" in notes.split(",")]
+        if plain:
+            table["packages"] = plain
+        if classic:
+            table["classic"] = classic
+        return table or None
 
 
 def mise_satisfied(versions, requested):
@@ -4578,8 +5035,7 @@ class MiseGroup(InstallGroup):
                     "array of versions"
                 )
             result[name] = versions
-        if not isinstance(self.table.get("global", True), bool):
-            fatal(f"{self.config_name}: the 'global' key in [mise] must be true or false")
+        install_bool(self.table, "global", True, self.where, self.config_name)
         return result
 
     def items(self):
@@ -4588,6 +5044,9 @@ class MiseGroup(InstallGroup):
             for name, versions in self.tools().items()
             for version in versions
         ]
+
+    def extra_keys(self):
+        return set(self.tools())
 
     def present(self):
         out = install_query(["mise", "ls", "--installed", "--json"], "list the mise tools")
@@ -4606,9 +5065,7 @@ class MiseGroup(InstallGroup):
             item.key for item in self.items()
             if mise_satisfied(installed.get(item.value[0], []), item.value[1])
         }
-        tools = self.tools()
-        extra = [f"tool '{name}'" for name in installed if name not in tools]
-        return InstallState(keys, extra)
+        return InstallState(keys, {name: f"tool '{name}'" for name in installed})
 
     def install(self, missing):
         tools = self.tools()
@@ -4663,7 +5120,8 @@ class NpmGroup(NamesGroup):
     def unavailable(self):
         return None if self.command() else "npm not found (install node, e.g. in [mise])"
 
-    def key(self, name):
+    @classmethod
+    def key(cls, name):
         return npm_name(name)
 
     @staticmethod
@@ -4793,9 +5251,8 @@ class CustomGroup(InstallGroup):
         name = table.get("name")
         if not isinstance(name, str) or not name.strip():
             fatal(f"{config_name}: a [[custom]] entry is missing its 'name'")
-        self.name = name
         where = f"[[custom]] '{name}'"
-        install_keys(table, self.keys, where, config_name)
+        super().__init__(table, config_name, where)
         for key in ("install", "check", "list", "requires"):
             value = table.get(key)
             if value is not None and not (isinstance(value, str) and value.strip()):
@@ -4810,9 +5267,9 @@ class CustomGroup(InstallGroup):
             fatal(f"{config_name}: {where} has a 'list' command but no 'items'")
         elif not table.get("check"):
             fatal(f"{config_name}: {where} needs a 'check' command")
-        super().__init__({}, config_name)
-        self.table = table
+        self.name = name
         self.title = name
+        self.scope = f"custom:{name}"
 
     def unavailable(self):
         requires = self.table.get("requires")
@@ -4832,9 +5289,7 @@ class CustomGroup(InstallGroup):
             if out is None:
                 return None
             names = install_lines(out)
-            wanted = {item.key for item in items}
-            extra = [f"{self.name} '{name}'" for name in names if name not in wanted]
-            return InstallState(names, extra)
+            return InstallState(names, {name: f"{self.name} '{name}'" for name in names})
         check = self.table["check"]
         if "items" not in self.table:
             return InstallState([self.name] if install_check(check) else [])
@@ -4851,16 +5306,27 @@ class CustomGroup(InstallGroup):
         )
 
 
+def manual_os(entry, where, config_name):
+    """Return the systems a [[manual]] entry is for: its 'os', else macOS for an 'app'
+    that is a name in the app folders, else every system."""
+    systems = install_os_list(entry, where, config_name)
+    app = entry.get("app")
+    if not systems and app and not app.startswith(("/", "~")):
+        return ["macos"]
+    return systems
+
+
 class ManualGroup(InstallGroup):
-    """[[manual]]: things to install by hand (managed apps, installers without a cask).
+    """[[manual]]: things to install by hand (managed apps, installers without a package).
     Install checks for them, by 'app' or 'check', and lists the missing ones with how."""
 
     section = "manual"
-    keys = ("name", "app", "check", "source", "url", "note")
+    keys = ("name", "app", "check", "source", "url", "note", "os")
 
     def __init__(self, entries, config_name):
-        super().__init__({}, config_name)
+        super().__init__({}, config_name, "[[manual]]")
         names = set()
+        self.entries = []
         for entry in entries:
             if not isinstance(entry, dict):
                 fatal(f"{config_name}: each [[manual]] entry must be a table")
@@ -4870,14 +5336,16 @@ class ManualGroup(InstallGroup):
             if name in names:
                 fatal(f"{config_name}: two [[manual]] entries are named '{name}'")
             names.add(name)
-            install_keys(entry, self.keys, f"[[manual]] '{name}'", config_name)
-            for key in self.keys[1:]:
+            where = f"[[manual]] '{name}'"
+            install_keys(entry, self.keys, where, config_name)
+            for key in ("app", "check", "source", "url", "note"):
                 value = entry.get(key)
                 if value is not None and not (isinstance(value, str) and value.strip()):
-                    fatal(f"{config_name}: the '{key}' key in [[manual]] '{name}' must be text")
+                    fatal(f"{config_name}: the '{key}' key in {where} must be text")
             if not entry.get("app") and not entry.get("check"):
-                fatal(f"{config_name}: [[manual]] '{name}' needs an 'app' or a 'check'")
-        self.entries = entries
+                fatal(f"{config_name}: {where} needs an 'app' or a 'check'")
+            if not os_mismatch(manual_os(entry, where, config_name)):
+                self.entries.append(entry)
 
     def items(self):
         return [InstallItem(e["name"], f"'{e['name']}'", e) for e in self.entries]
@@ -4904,9 +5372,11 @@ class ManualGroup(InstallGroup):
     def draft():
         """List the apps that came neither from a cask nor the App Store, nor with macOS."""
         apps = app_bundles()
+        if not apps:
+            return None
         ids = app_store_ids(apps)
         cask_apps = set()
-        if install_which("brew"):
+        if install_which("brew") and not is_root():
             argv = ["brew", "info", "--cask", "--installed", "--json=v2"]
             out = install_query(argv, "list the apps of the Homebrew casks")
             try:
@@ -4941,8 +5411,15 @@ class ManualGroup(InstallGroup):
 
 # The group class of each built-in section, in INSTALL_SECTIONS order
 INSTALL_GROUPS = {
+    "apt": AptGroup,
+    "dnf": DnfGroup,
+    "pacman": PacmanGroup,
+    "zypper": ZypperGroup,
+    "apk": ApkGroup,
     "brew": BrewGroup,
     "mas": MasGroup,
+    "flatpak": FlatpakGroup,
+    "snapd": SnapdGroup,
     "custom": CustomGroup,
     "mise": MiseGroup,
     "npm": NpmGroup,
@@ -4974,7 +5451,8 @@ def install_order(config, config_name):
 def install_groups(config, config_name, only=None, skip=None):
     """Build and verify every group of an install config, in install order.
 
-    A built-in section the config leaves out still gets an empty group, so a status can
+    A built-in section is one table ([brew]) or an array of them ([[brew]], each with
+    its own 'os'). One the config leaves out still gets an empty group, so a status can
     show what that tool has installed. only and skip select sections by name.
     """
     unknown = [key for key in config if key != "install" and key not in INSTALL_SECTIONS]
@@ -5002,11 +5480,16 @@ def install_groups(config, config_name, only=None, skip=None):
                 built = [ManualGroup(value, config_name)]
         else:
             if value is None:
-                value = {}
-            if not isinstance(value, dict):
-                fatal(f"{config_name}: [{name}] must be a table")
-            built = [INSTALL_GROUPS[name](value, config_name)]
-            built[0].items()  # verifies its values
+                tables, where = [{}], f"[{name}]"
+            elif isinstance(value, dict):
+                tables, where = [value], f"[{name}]"
+            elif isinstance(value, list) and all(isinstance(t, dict) for t in value):
+                tables, where = value, f"[[{name}]]"
+            else:
+                fatal(f"{config_name}: [{name}] must be a table, or an array of tables")
+            built = [INSTALL_GROUPS[name](table, config_name, where) for table in tables]
+            for group in built:
+                group.items()  # verifies its values
         if (only and name not in only) or (skip and name in skip):
             continue
         groups += built
@@ -5025,14 +5508,30 @@ def install_section_list(value):
     return names
 
 
+def install_wanted(groups):
+    """Map each scope to the keys its groups on this system ask for."""
+    wanted = {}
+    for group in groups:
+        if not group.wrong_os():
+            wanted.setdefault(group.scope, set()).update(group.extra_keys())
+    return wanted
+
+
 def install_status(groups, config_name):
     """Show, per group, what is missing and what is installed but not in the config."""
     emit(f"Install status for {root_shown(config_name)}")
+    wanted = install_wanted(groups)
+    reported = set()
     missing_count = 0
     extra_count = 0
     skipped = 0
     for group in groups:
         items = group.items()
+        reason = group.wrong_os()
+        if reason:
+            if items and __verbose__:
+                step_skipped(group.title, reason)
+            continue
         reason = group.unavailable()
         if reason:
             if items:
@@ -5045,7 +5544,11 @@ def install_status(groups, config_name):
         state = group.present()
         if state is None:
             continue
-        extra = state.extra
+        extra = []
+        if group.scope not in reported:
+            reported.add(group.scope)
+            extra = [label for key, label in state.found.items()
+                     if key not in wanted.get(group.scope, ())]
         if not items:
             if not extra:
                 continue
@@ -5053,6 +5556,8 @@ def install_status(groups, config_name):
         missing = [item for item in items if item.key not in state.installed]
         if items:
             say(f"installed: {len(items) - len(missing)} of {len(items)}")
+        for line in group.notes():
+            say(f"skip: {line}")
         for item in missing:
             how = ManualGroup.how(item.value) if group.section == "manual" else ""
             say(f"missing: {item.label}" + (f" ({how})" if how else ""))
@@ -5082,6 +5587,12 @@ def install_all(groups, config_name):
         items = group.items()
         if not items:
             continue
+        # Sections for other systems are expected in a shared config: --verbose shows them
+        reason = group.wrong_os()
+        if reason:
+            if __verbose__:
+                step_skipped(group.title, reason)
+            continue
         reason = group.unavailable()
         if reason:
             step_skipped(group.title, f"{reason}; {plural(len(items), 'item')} not installed")
@@ -5096,9 +5607,13 @@ def install_all(groups, config_name):
             continue
         if not missing:
             step_skipped(group.title, f"{plural(len(items), 'item')} already installed")
+            for line in group.notes():
+                say(f"skip: {line}")
             continue
 
         step(f"Installing {group.title}")
+        for line in group.notes():
+            say(f"skip: {line}")
         for item in missing:
             say(f"missing: {item.label}")
         failures = group.install(missing)
@@ -5139,9 +5654,11 @@ def install_all(groups, config_name):
 
 
 def brewfile_text(groups):
-    """Return a Brewfile of the [brew] and [mas] groups' items."""
+    """Return a Brewfile of the [brew] and [mas] items for this system."""
     lines = []
     for group in groups:
+        if group.wrong_os():
+            continue
         if group.section == "brew":
             lines += [item.value for item in group.items()]
         elif group.section == "mas":
@@ -5179,9 +5696,9 @@ def install_draft_text(only=None, skip=None):
         f"# Draft of what is installed on {platform.node() or 'this machine'}, written by",
         f"# 'molt.py install --draft' on {datetime.now().strftime('%Y-%m-%d')}.",
         "# Review it before installing from it: molt.py install -t <this file> --dry-run",
-        "# [[manual]] lists the apps that came from neither a cask nor the App Store: install",
-        "# them by hand, or move them to [brew] casks. See configs/example-install.toml for",
-        "# [[custom]] commands (installers, rustup targets) and [install] order.",
+        "# On macOS, [[manual]] lists the apps that came from neither a cask nor the App",
+        "# Store. To share one config between systems, give a table an 'os' key. See",
+        "# configs/example-install.toml for that, [[custom]] commands, and [install] order.",
     ]
     count = 0
     for name in INSTALL_SECTIONS:
@@ -5538,11 +6055,6 @@ def cmd_migrate(args):
 
 def cmd_install(args):
     """Install what install.toml lists, or show its status, write its Brewfile or a draft."""
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        fatal(
-            "Cannot run molt.py install as root: Homebrew refuses to run as root",
-            "Run it as your user; installers ask for sudo when they need it",
-        )
     only, skip = args.only, args.skip
 
     if args.draft:
@@ -5896,13 +6408,15 @@ def setup_parser():
         "install", formatter_class=formatter, add_help=False,
         help="Install the packages and apps install.toml lists, or show what is missing",
         description=(
-            "Install what configs/install.toml lists and this machine is missing: Homebrew\n"
-            "taps, formulae and casks, App Store apps, mise runtimes, npm, cargo and uv\n"
-            "tools, VS Code extensions, and [[custom]] commands, in that order unless\n"
-            "[install] order sets another. Nothing installed is upgraded. [[manual]]\n"
-            "entries are only checked, and listed at the end as left to install by hand.\n"
-            "--status shows what is missing and what is installed but not in the config;\n"
-            "--draft writes a config of what is installed here, to start one from."
+            "Install what configs/install.toml lists and this machine is missing: system\n"
+            "packages (apt, dnf, pacman, zypper, apk), Homebrew, App Store apps, Flatpak\n"
+            "apps and snaps, [[custom]] commands, mise runtimes, npm, cargo and uv tools,\n"
+            "and VS Code extensions, in that order unless [install] order sets another.\n"
+            "Tables with an 'os' key for other systems are left out, so one config can\n"
+            "cover macOS and Linux. Nothing installed is upgraded. [[manual]] entries are\n"
+            "only checked, and listed at the end as left to install by hand. --status\n"
+            "shows what is missing and what is installed but not in the config; --draft\n"
+            "writes a config of what is installed here, to start one from."
         ),
     )
     ins_molt = ins.add_argument_group("molt options")

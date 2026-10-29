@@ -3,14 +3,42 @@
 # 'molt install --status' shows what is missing; 'molt install --dry-run' shows what a real
 # run would install. To start from what this machine has: molt install --draft draft.toml
 
-# Sections install in this order unless [install] order sets another: brew, mas, custom,
-# mise, npm, cargo, uv, vscode, manual. Nothing already installed is upgraded. Sections
-# left out of 'order' follow it, in that order.
+# Sections install in this order unless [install] order sets another: apt, dnf, pacman,
+# zypper, apk, brew, mas, flatpak, snapd, custom, mise, npm, cargo, uv, vscode, manual.
+# Nothing already installed is upgraded. Sections left out of 'order' follow it, in that
+# order.
 # [install]
 # order = ["custom", "brew"]   # e.g. when a [[custom]] entry installs Homebrew itself
 
+# One file can cover macOS and Linux: any table or entry can take an 'os' key ("macos",
+# "linux", or a distro such as "ubuntu" or "debian", which also covers Ubuntu), and is
+# left out on other systems. A section can be an array of tables ([[brew]]) to list
+# different items per system; TOML doesn't allow [brew] and [[brew]] in one file.
+
+# Linux system packages, installed as root (through sudo when molt isn't root). Each
+# section is skipped on machines without its package manager, so list one per distro
+# you use. apt runs 'apt-get update' first (update = false skips it)
+# [apt]
+# packages = ["build-essential", "curl", "git"]
+# [dnf]
+# packages = ["gcc", "curl", "git"]
+# [pacman]
+# packages = ["base-devel", "git"]   # update = true also runs 'pacman -Syu'
+# [zypper]
+# packages = ["git"]
+# [apk]
+# packages = ["git", "bash"]
+
+# Flatpak apps from flathub (added when missing), for this user, and snaps
+# [flatpak]
+# apps = ["org.gimp.GIMP"]
+# [snapd]
+# packages = ["hello"]
+# classic = ["nvim"]   # snaps that need --classic
+
 # Homebrew: installed with 'brew bundle install --no-upgrade'. A cask whose app is already
-# in /Applications is adopted. 'molt install --brewfile Brewfile' writes these as a Brewfile
+# in /Applications is adopted. Casks are macOS only: on Linux they are left out, and the
+# formulae still install. 'molt install --brewfile Brewfile' writes these as a Brewfile
 [brew]
 taps = []
 formulae = [
@@ -24,7 +52,7 @@ casks = [
 ]
 
 # Mac App Store apps, by name and id (the number in the app's App Store URL). They
-# install with mas through brew bundle, so the App Store must be signed in
+# install with mas through brew bundle, so the App Store must be signed in. macOS only
 [mas.apps]
 # Xcode = 497799835
 
@@ -76,8 +104,14 @@ extensions = [
 # Things to install by hand: apps your company's device management installs, or
 # installers with no cask. They are only checked, by 'app' (in /Applications or
 # ~/Applications, or a path) or a 'check' command, and listed at the end of an install
-# run with their source, url and note
+# run with their source, url and note. An 'app' in /Applications is macOS only
 # [[manual]]
 # name = "Slack"
 # app = "Slack.app"
 # source = "Self Service"
+#
+# [[manual]]
+# name = "VPN client"
+# os = "linux"
+# check = "command -v openconnect"
+# note = "from the IT wiki"

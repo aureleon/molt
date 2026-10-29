@@ -95,9 +95,10 @@ molt copies itself and the config to the host for the run, and removes them afte
 ## Installing packages and apps
 
 `molt install` installs what `~/.molt/configs/install.toml` lists and the machine doesn't
-have yet: Homebrew taps, formulae, and casks, App Store apps, mise runtimes, npm, cargo, and
-uv tools, and VS Code extensions. Anything else goes in a `[[custom]]` entry as a shell
-`check` and `install` command. Apps that only IT or a vendor's installer can provide go in
+have yet: system packages (apt, dnf, pacman, zypper, or apk), Homebrew taps, formulae, and
+casks, App Store apps, Flatpak apps and snaps, mise runtimes, npm, cargo, and uv tools, and
+VS Code extensions. Anything else goes in a `[[custom]]` entry as a shell `check` and
+`install` command. Apps that only IT or a vendor's installer can provide go in
 `[[manual]]`, which molt only checks for, and lists at the end of a run with where to get
 them.
 
@@ -114,8 +115,11 @@ It never upgrades what is already installed, and only retries what is still miss
 re-running it is safe. With `[install] draft = true` in capture.toml, every capture also saves
 a draft `install.toml` in the snapshot, for the next machine.
 
-For now install covers macOS. Linux package managers (apt, dnf, pacman, and friends) are TODO,
-but `[[custom]]` entries already work there.
+One config can cover both your Mac and your Linux boxes. Any table can take an
+`os = "linux"` (or `"macos"`, or a distro like `"ubuntu"`), and is left out everywhere
+else, so `[apt]` and `[dnf]` can sit next to each other, and casks and App Store apps are
+simply skipped on Linux. The system package managers run through sudo, or directly as
+root, e.g. in a container.
 
 See [install.toml](docs/configuration.md#installtoml) and
 [installing packages](docs/usage.md#install-packages-and-apps) for every section and option.

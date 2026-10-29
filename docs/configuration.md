@@ -108,12 +108,39 @@ For encryption, `[capture.age]` holds the recipients and `[restore.age]` the ide
 
 ### install.toml
 
-Lists what `molt install` installs on a machine. Every section is optional. Start from a
-draft of what a machine has: `molt install --draft draft.toml`.
+Lists what `molt install` installs on a machine. Every section is optional, and one file
+can cover macOS and Linux machines (see [Systems](#systems) below). Start from a draft of
+what a machine has: `molt install --draft draft.toml`.
 
 ```toml
 [install]
 order = ["custom", "brew"]   # optional; the sections it leaves out follow, in default order
+
+[apt]                        # Debian, Ubuntu
+packages = ["build-essential", "curl", "git"]
+update = true                # 'apt-get update' first (the default)
+
+[dnf]                        # Fedora, RHEL, Amazon Linux
+packages = ["gcc", "curl", "git"]
+
+[pacman]                     # Arch
+packages = ["base-devel", "git"]
+update = false               # true: 'pacman -Syu' with the install, which upgrades the system
+
+[zypper]                     # openSUSE, SLES
+packages = ["git"]
+
+[apk]                        # Alpine
+packages = ["git", "bash"]
+
+[flatpak]
+apps = ["org.gimp.GIMP"]
+remote = "flathub"           # the default; flathub is added when it is missing
+user = true                  # the default: --user, no root needed
+
+[snapd]
+packages = ["hello"]
+classic = ["nvim"]           # snaps that need --classic
 
 [brew]
 taps = ["powershell/tap"]
@@ -160,15 +187,21 @@ app = "Slack.app"            # in /Applications or ~/Applications, or a path; or
 source = "Self Service"      # 'source', 'url' and 'note' say how to get it
 ```
 
-Sections install in this order, unless `[install] order` sets another: `brew`, `mas`,
-`custom`, `mise`, `npm`, `cargo`, `uv`, `vscode`, `manual`. Homebrew goes first since it
+Sections install in this order, unless `[install] order` sets another: `apt`, `dnf`,
+`pacman`, `zypper`, `apk`, `brew`, `mas`, `flatpak`, `snapd`, `custom`, `mise`, `npm`,
+`cargo`, `uv`, `vscode`, `manual`. The system package managers go first, since on Linux
+they install what Homebrew and the language tools build with; Homebrew comes next, as it
 installs most other tools; `custom` comes before the language tools, so it can install
 their managers.
 
+- The system package managers (`apt` through `apk`) and `snapd` run as root: directly
+  when molt runs as root, else through sudo. Each one is skipped on machines that don't
+  have it, so a config can list packages for several distros.
 - `[brew]` and `[mas]` install through `brew bundle install --no-upgrade`, with only the
   missing items in its Brewfile. A cask whose app is already in `/Applications` is
   adopted. App Store apps install with mas, which brew installs first if needed; the App
-  Store must be signed in, and an app must have been bought or claimed before.
+  Store must be signed in, and an app must have been bought or claimed before. Homebrew
+  won't run as root, so as root both are skipped.
 - `[[custom]]` commands run with bash. `check` exits 0 when the thing is installed. With
   `items`, each item gets its own check and install, with `{item}` replaced by the item,
   shell-quoted. A `list` command that prints the installed items, one per line, takes the
@@ -178,6 +211,40 @@ their managers.
   or offers in a self-service portal, or installers without a cask.
 
 A typo is an error: an unknown table or key stops the run before anything is installed.
+
+#### Systems
+
+Any table, `[[custom]]` entry or `[[manual]]` entry can take an `os` key: a system name,
+or an array of them. It is then only used on those systems, and left out elsewhere (shown
+only with `--verbose`). The names are `macos`, `linux`, and on Linux the distro's `ID` and
+`ID_LIKE` from `/etc/os-release`, so `"debian"` also covers Ubuntu and `"fedora"` covers
+Amazon Linux.
+
+To list different items per system, write a section as an array of tables instead of one
+table, each with its own `os` (TOML doesn't allow `[brew]` and `[[brew]]` in one file):
+
+```toml
+[[brew]]
+formulae = ["jj", "ripgrep"]
+
+[[brew]]
+os = "macos"
+casks = ["ghostty"]
+
+[[brew]]
+os = "linux"
+formulae = ["gcc"]
+
+[[custom]]
+name = "rustup"
+os = ["macos", "linux"]
+check = "command -v rustup"
+install = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+```
+
+Some parts are macOS only without an `os` key: `[mas]`, casks (on Linux a table's casks
+are left out, and its formulae still install), and `[[manual]]` entries whose `app` is a
+name in `/Applications`. `[[manual]]` entries with a `check` work everywhere.
 
 ## Encryption
 

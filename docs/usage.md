@@ -362,43 +362,55 @@ molt install --draft draft.toml          # write a config of what this machine h
 molt install --status                    # what is missing, and what isn't in the config
 molt install --dry-run                   # show what a real run would install
 molt install                             # install what is missing
-molt install --only brew,mas             # only some sections
+molt install --only apt,brew             # only some sections
 molt install --brewfile Brewfile         # the [brew] and [mas] items as a Brewfile
 molt install -t /path/to/snapshot/install.toml --dry-run
 ```
 
 `install` reads `configs/install.toml` (see [install.toml](configuration.md#installtoml))
-and installs what this machine is missing, section by section: Homebrew taps, formulae
-and casks, App Store apps, `[[custom]]` commands, mise runtimes, npm, cargo and uv tools,
-and VS Code extensions. It never upgrades what is already installed. After each section
-it checks again, and reports any item that still isn't installed as an error (the run
-then exits 1). A section whose tool is missing (`cargo not found`) is skipped, so a
-later run picks it up once an earlier section, or you, installed the tool.
-`[[manual]]` entries are only checked; the ones missing are listed at the end, with
-where to get them.
+and installs what this machine is missing, section by section: system packages (apt,
+dnf, pacman, zypper, or apk), Homebrew taps, formulae and casks, App Store apps, Flatpak
+apps and snaps, `[[custom]]` commands, mise runtimes, npm, cargo and uv tools, and VS
+Code extensions. It never upgrades what is already installed. After each section it
+checks again, and reports any item that still isn't installed as an error (the run then
+exits 1). A section whose tool is missing (`cargo not found`) is skipped, so a later run
+picks it up once an earlier section, or you, installed the tool. `[[manual]]` entries are
+only checked; the ones missing are listed at the end, with where to get them.
 
-Installers can prompt (sudo for a cask's pkg, an App Store sign-in, a `curl | sh`
-installer), so install commands run on the terminal, and their output is not indented.
-Without a terminal, their stdin is `/dev/null`, so a prompt fails instead of waiting.
-Commands are found on `PATH`, then in `/opt/homebrew/bin`, `/usr/local/bin`,
-`~/.cargo/bin`, `~/.local/bin`, and the VS Code app, so a tool one section installs is
-found by the next one before a new shell has added it to `PATH`.
+One config can cover macOS and Linux: tables meant for another system are left out
+quietly (`--verbose` lists them). That is a table whose `os` key doesn't name this one,
+a system package manager that isn't on this machine (`[dnf]` on Ubuntu), and the macOS
+only parts on Linux (App Store apps, casks, and `[[manual]]` apps in `/Applications`).
+
+The system package managers run as root: directly when molt runs as root (in a
+container, say), else through sudo. Homebrew refuses to run as root, so as root its
+sections are skipped. Flatpak apps install for your user by default, without root.
+
+Installers can prompt (a sudo password, an App Store sign-in, a `curl | sh` installer),
+so install commands run on the terminal, and their output is not indented. Without a
+terminal, their stdin is `/dev/null`, so a prompt fails instead of waiting (sudo then
+needs NOPASSWD). Commands are found on `PATH`, then in `/opt/homebrew/bin`,
+`/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`, `~/.cargo/bin`, `~/.local/bin`,
+`/snap/bin`, and the VS Code app, so a tool one section installs is found by the next one
+before a new shell has added it to `PATH`.
 
 `--status` changes nothing. Per section, it shows how many items are installed, each
-missing one, and what that tool has installed that the config doesn't list (formulae
-installed on request, casks, global npm packages, and so on). A section the config leaves
-out is shown only when its tool has installed something.
+missing one, and what that tool has installed that the config doesn't list: formulae
+installed on request, casks, global npm packages, and for system packages the ones that
+were asked for and that nothing else depends on (with apt and dnf5; dnf4 can't tell, so
+it lists every package a user installed). A section the config leaves out is shown only
+when its tool has installed something.
 
-`--draft FILE` writes a config of what this machine has installed: taps, formulae
-installed on request and casks, App Store apps (by their Spotlight ids, so neither mas
-nor a sign-in is needed), the global mise tools, npm, cargo and uv tools, VS Code
-extensions, and a `[[manual]]` entry for each app that came from neither a cask, the App
-Store, nor Apple. Review it before installing from it. With `[install] draft = true` in
-capture.toml, each capture saves one in the snapshot as `install.toml`.
+`--draft FILE` writes a config of what this machine has installed, from the same lists:
+system packages, taps, formulae and casks, App Store apps (by their Spotlight ids, so
+neither mas nor a sign-in is needed), Flatpak apps and snaps, the global mise tools, npm,
+cargo and uv tools, VS Code extensions, and on macOS a `[[manual]]` entry for each app
+that came from neither a cask, the App Store, nor Apple. Review it before installing from
+it. With `[install] draft = true` in capture.toml, each capture saves one in the snapshot
+as `install.toml`.
 
 `--draft` and `--brewfile` write `-` to stdout, and never replace an existing file
-without `--force`. `install` refuses to run as root, since Homebrew does, and works on a
-local molt root only.
+without `--force`. `install` works on a local molt root only.
 
 ## Command Line Options
 
@@ -470,7 +482,8 @@ A path on a host is relative to its login directory unless it is absolute (`~` a
 --dry-run, --verbose            Show the install commands only; show every query too
 ```
 
-Sections: `brew`, `mas`, `custom`, `mise`, `npm`, `cargo`, `uv`, `vscode`, `manual`.
+Sections: `apt`, `dnf`, `pacman`, `zypper`, `apk`, `brew`, `mas`, `flatpak`, `snapd`, `custom`,
+`mise`, `npm`, `cargo`, `uv`, `vscode`, `manual`.
 
 ### Check Options
 

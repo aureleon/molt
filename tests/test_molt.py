@@ -4310,10 +4310,18 @@ def fake_tool(bin_dir, name, body):
     return path
 
 
+# The real commands the fakes and test commands need; no package manager is among them
+INSTALL_TEST_TOOLS = [
+    "awk", "basename", "bash", "cat", "cp", "env", "find", "grep", "ls", "mkdir", "rm",
+    "sed", "sh", "touch",
+]
+
+
 @pytest.fixture
 def inst(tmp_path, monkeypatch):
-    """An in-process 'molt install' with fake tools only: PATH is the fakes plus the
-    system dirs, the extra install dirs are off, and apps are looked for in a temp dir."""
+    """An in-process 'molt install' with fake tools only: PATH is the fakes plus links to
+    a few plain commands, the extra install dirs are off, apps are looked for in a temp
+    dir, and the system is macOS unless a test calls inst.on()."""
     home = tmp_path / "home"
     home.mkdir()
     root = tmp_path / "root"
@@ -4325,9 +4333,16 @@ def inst(tmp_path, monkeypatch):
     apps = tmp_path / "Applications"
     apps.mkdir()
     log = tmp_path / "calls.log"
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    for name in INSTALL_TEST_TOOLS:
+        found = shutil.which(name)
+        if not found:
+            pytest.skip(f"{name} not found")
+        (tools / name).symlink_to(found)
 
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{tools}")
     monkeypatch.setenv("FAKE_STATE", str(state))
     monkeypatch.setenv("FAKE_LOG", str(log))
     monkeypatch.setattr(molt, "INSTALL_PATH_DIRS", [])
@@ -4335,10 +4350,11 @@ def inst(tmp_path, monkeypatch):
     monkeypatch.setattr(molt, "__dry_run__", False)
     monkeypatch.setattr(molt, "__verbose__", False)
     monkeypatch.setitem(molt._reported, "errors", 0)
-    for name in ("brew", "mise", "npm", "cargo", "uv", "code", "mas"):
-        if shutil.which(name, path=os.environ["PATH"]) and not (bin_dir / name).exists():
-            # A real one in /usr/bin or /bin would answer instead of a missing tool
-            pytest.skip(f"a real {name} is on the system PATH")
+
+    def on(*names):
+        monkeypatch.setattr(molt, "install_os", lambda: set(names))
+
+    on("macos", "darwin")
 
     def config(text):
         (root / "configs" / "install.toml").write_text(text)
@@ -4360,7 +4376,7 @@ def inst(tmp_path, monkeypatch):
 
     return argparse.Namespace(
         tmp=tmp_path, home=home, root=root, bin=bin_dir, state=state, apps=apps,
-        config=config, installed=installed, run=run, calls=calls,
+        config=config, installed=installed, run=run, calls=calls, on=on,
     )
 
 
@@ -4529,7 +4545,10 @@ def test_install_order_only_and_skip(inst):
         "custom": [{"name": "c", "check": "true", "install": "true"}],
     }
     sections = [g.section for g in molt.install_groups(config, "install.toml")]
-    assert sections == ["custom", "brew", "mas", "mise", "npm", "cargo", "uv", "vscode"]
+    assert sections == [
+        "custom", "brew", "apt", "dnf", "pacman", "zypper", "apk", "mas", "flatpak", "snapd",
+        "mise", "npm", "cargo", "uv", "vscode",
+    ]
     only = molt.install_groups(config, "install.toml", only=["cargo", "custom"])
     assert [g.section for g in only] == ["custom", "cargo"]
     skipped = molt.install_groups(config, "install.toml", skip=["custom", "brew"])
@@ -4613,11 +4632,14 @@ def test_folder_app_picks_the_main_app(tmp_path):
     assert molt.folder_app(tmp_path / "Cisco").name == "Cisco Secure Client.app"
 
 
-def test_install_refuses_to_run_as_root(inst, capfd, monkeypatch):
+def test_homebrew_is_skipped_as_root(inst, capfd, monkeypatch):
+    fake_tool(inst.bin, "brew", FAKE_BREW)
     monkeypatch.setattr(molt.os, "geteuid", lambda: 0)
-    inst.config("")
-    assert inst.run("--status") == 1
-    assert "Cannot run molt.py install as root" in capfd.readouterr().err
+    inst.config('[brew]\nformulae = ["jj"]\n')
+    assert inst.run() == 0
+    out = capfd.readouterr().out
+    assert "Skipping brew (Homebrew can't run as root; 1 item not installed)" in out
+    assert inst.calls() == []
 
 
 def test_capture_config_install_table_is_verified():
@@ -4664,3 +4686,256 @@ def test_resolve_root_falls_back_to_the_old_snap_root(tmp_path, monkeypatch, cap
     # Once ~/.molt exists, it wins
     (tmp_path / ".molt").mkdir()
     assert molt.resolve_root(molt.DEFAULT_ROOT) == (tmp_path / ".molt").resolve()
+
+
+# --- molt install on Linux --- #
+
+# A fake sudo that logs and runs the command, and fake apt tools whose state is files
+FAKE_SUDO = '#!/bin/sh\necho "sudo $*" >> "$FAKE_LOG"\nexec "$@"\n'
+FAKE_APT = {
+    "apt-get": r"""#!/bin/sh
+echo "apt-get $* [frontend=${DEBIAN_FRONTEND:-}]" >> "$FAKE_LOG"
+if [ "$1" = install ]; then
+    shift 2
+    for pkg in "$@"; do echo "$pkg" >> "$FAKE_STATE/apt"; done
+fi
+exit 0
+""",
+    "dpkg-query": r"""#!/bin/sh
+[ -f "$FAKE_STATE/apt" ] && sed 's/^/ii \t/' "$FAKE_STATE/apt"
+printf 'rc \tremoved-one\n'
+exit 0
+""",
+    "apt-mark": '#!/bin/sh\n[ -f "$FAKE_STATE/apt" ] && cat "$FAKE_STATE/apt"\nexit 0\n',
+}
+
+
+def fake_apt(inst, sudo=True, installed=()):
+    for name, body in FAKE_APT.items():
+        fake_tool(inst.bin, name, body)
+    if sudo:
+        fake_tool(inst.bin, "sudo", FAKE_SUDO)
+    inst.installed(apt=installed)
+
+
+def test_install_os_reads_the_distro_from_os_release(monkeypatch):
+    monkeypatch.setattr(molt, "_install_os", {})
+    monkeypatch.setattr(molt.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(molt.platform, "freedesktop_os_release",
+                        lambda: {"ID": "ubuntu", "ID_LIKE": "debian"})
+    assert molt.install_os() == {"linux", "ubuntu", "debian"}
+    assert molt.os_mismatch(["debian"]) is None
+    assert molt.os_mismatch(["macos", "fedora"]) == "for macos or fedora only"
+
+
+def test_apt_installs_through_sudo_after_an_update(inst, capfd):
+    inst.on("linux", "ubuntu", "debian")
+    fake_apt(inst, installed=["git"])
+    inst.config('[apt]\npackages = ["git", "curl", "removed-one"]\n')
+
+    assert inst.run() == 0
+    assert inst.calls() == [
+        "sudo apt-get update",
+        "apt-get update [frontend=]",
+        "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y curl removed-one",
+        "apt-get install -y curl removed-one [frontend=noninteractive]",
+    ]
+    out = capfd.readouterr().out
+    assert "  ✓ 'curl' installed" in out
+    assert "  ✓ 'removed-one' installed" in out  # 'rc' isn't installed
+
+
+def test_apt_runs_without_sudo_as_root_and_can_skip_the_update(inst, monkeypatch):
+    inst.on("linux")
+    monkeypatch.setattr(molt.os, "geteuid", lambda: 0)
+    fake_apt(inst, sudo=False)
+    inst.config('[apt]\npackages = ["curl"]\nupdate = false\n')
+
+    assert inst.run() == 0
+    assert inst.calls() == ["apt-get install -y curl [frontend=noninteractive]"]
+
+
+def test_system_sections_need_root_or_sudo(inst, capfd):
+    inst.on("linux")
+    fake_apt(inst, sudo=False)
+    inst.config('[apt]\npackages = ["curl"]\n')
+
+    assert inst.run() == 0
+    out = capfd.readouterr().out
+    assert "Skipping apt (not root, and sudo not found; 1 item not installed)" in out
+
+
+@pytest.mark.parametrize("section, fakes, run", [
+    ("dnf", {"dnf": "", "rpm": ""}, "run: sudo dnf install -y jq"),
+    ("pacman", {"pacman": ""}, "run: sudo pacman -S --needed --noconfirm jq"),
+    ("zypper", {"zypper": "", "rpm": ""}, "run: sudo zypper --non-interactive install jq"),
+    ("apk", {"apk": ""}, "run: sudo apk add jq"),
+])
+def test_linux_package_managers_dry_run(inst, capfd, section, fakes, run):
+    inst.on("linux")
+    fake_tool(inst.bin, "sudo", FAKE_SUDO)
+    for name in fakes:
+        fake_tool(inst.bin, name, '#!/bin/sh\necho "$0 $*" >> "$FAKE_LOG"\nexit 0\n')
+    inst.config(f'[{section}]\npackages = ["jq"]\n')
+
+    assert inst.run("--dry-run") == 0
+    assert run in capfd.readouterr().out
+    # Only queries ran: nothing installs in a dry run
+    assert not any(" install " in call or " add " in call or " -S " in call
+                   for call in inst.calls())
+
+
+def test_pacman_update_upgrades_the_system_with_the_install(inst, capfd):
+    inst.on("linux")
+    fake_tool(inst.bin, "sudo", FAKE_SUDO)
+    fake_tool(inst.bin, "pacman", "#!/bin/sh\nexit 0\n")
+    inst.config('[pacman]\npackages = ["jq"]\nupdate = true\n')
+    assert inst.run("--dry-run") == 0
+    assert "run: sudo pacman -Syu --needed --noconfirm jq" in capfd.readouterr().out
+
+
+def test_requested_package_lists_parse():
+    zypper = (
+        "S  | Repository | Name  | Version | Arch\n"
+        "---+------------+-------+---------+-------\n"
+        "i+ | repo-oss   | vim   | 9.1     | x86_64\n"
+        "i  | repo-oss   | git   | 2.46    | x86_64\n"
+        "v  | repo-oss   | emacs | 29      | x86_64\n"
+    )
+    assert molt.ZypperGroup.parse_requested(zypper) == ["vim", "git"]
+    assert molt.ApkGroup.parse_requested("alpine-base\ncurl\npy3-pip>=23\nfoo@edge\n") == [
+        "alpine-base", "curl", "py3-pip", "foo",
+    ]
+
+
+def test_flatpak_adds_flathub_and_installs_for_the_user(inst, capfd):
+    inst.on("linux")
+    fake_tool(inst.bin, "flatpak", "#!/bin/sh\nexit 0\n")
+    inst.config('[flatpak]\napps = ["org.gimp.GIMP"]\n')
+    assert inst.run("--dry-run") == 0
+    out = capfd.readouterr().out
+    assert ("run: flatpak remote-add --if-not-exists --user flathub "
+            "https://dl.flathub.org/repo/flathub.flatpakrepo") in out
+    assert "run: flatpak install --user -y --noninteractive flathub org.gimp.GIMP" in out
+
+
+SNAP_LIST = """Name     Version  Rev   Tracking       Publisher   Notes
+core22   2024     1380  latest/stable  canonical✓  base
+snapd    2.63     21759 latest/stable  canonical✓  snapd
+code     1.95     174   latest/stable  vscode✓     classic
+hello    2.10     42    latest/stable  canonical✓  -
+"""
+
+
+def test_snapd_lists_its_own_snaps_and_installs_classic_ones_alone(inst, capfd):
+    inst.on("linux")
+    fake_tool(inst.bin, "sudo", FAKE_SUDO)
+    fake_tool(inst.bin, "snap", f"#!/bin/sh\ncat <<'EOF'\n{SNAP_LIST}EOF\n")
+    inst.config('[snapd]\npackages = ["hello", "jq"]\nclassic = ["nvim", "go"]\n')
+
+    assert inst.run("--status") == 0
+    out = capfd.readouterr().out
+    assert "  not in config: 'code'" in out
+    assert "core22" not in out and "'snapd'" not in out  # snapd's own
+    assert inst.run("--dry-run") == 0
+    out = capfd.readouterr().out
+    snap = inst.bin / "snap"
+    assert f"run: sudo {snap} install jq" in out
+    assert f"run: sudo {snap} install --classic nvim" in out
+    assert f"run: sudo {snap} install --classic go" in out
+
+
+def test_snapd_is_not_an_old_molt_named_snap(inst):
+    shutil.copy2(MOLT, inst.bin / "snap")
+    assert molt.snapd_command() is None
+
+
+def test_casks_are_left_out_on_linux(inst, capfd):
+    inst.on("linux")
+    fake_tool(inst.bin, "brew", FAKE_BREW)
+    inst.installed(formulae=["jj"])
+    inst.config('[brew]\nformulae = ["jj"]\ncasks = ["ghostty"]\n')
+
+    assert inst.run() == 0
+    out = capfd.readouterr().out.splitlines()
+    assert "Skipping brew (1 item already installed)" in out
+    assert "  skip: cask 'ghostty' (macOS only)" in out
+    assert not any("--cask" in call for call in inst.calls())
+    assert inst.run("--brewfile", "-") == 0
+    assert capfd.readouterr().out == 'brew "jj"\n'
+
+
+def test_os_keys_pick_the_tables_for_this_system(inst, capfd):
+    inst.on("linux", "fedora")
+    fake_tool(inst.bin, "brew", FAKE_BREW)
+    inst.installed(formulae=["jj", "gcc", "wget"])
+    inst.config(
+        '[[brew]]\nformulae = ["jj"]\n\n'
+        '[[brew]]\nos = "macos"\nformulae = ["coreutils"]\n\n'
+        '[[brew]]\nos = ["debian", "fedora"]\nformulae = ["gcc"]\n\n'
+        '[[custom]]\nname = "mac only"\nos = "macos"\ncheck = "false"\ninstall = "true"\n\n'
+        '[[manual]]\nname = "Slack"\napp = "Slack.app"\n\n'
+        '[[manual]]\nname = "Toolbox"\ncheck = "false"\nos = "linux"\n'
+    )
+
+    assert inst.run("--status", "--verbose") == 0
+    out = capfd.readouterr().out.splitlines()
+    assert "Skipping brew (macos) (for macos only)" in out
+    assert "Checking brew (debian, fedora)..." in out
+    assert "Skipping mac only (for macos only)" in out
+    # Formulae of every [[brew]] for this system count, and the rest is listed once
+    assert [line for line in out if "not in config" in line] == [
+        "  not in config: formula 'wget'",
+    ]
+    # An app in /Applications is a macOS thing; a check works anywhere
+    assert "  missing: 'Toolbox'" in out
+    assert not any("Slack" in line for line in out)
+
+
+def test_os_key_errors(inst, capfd):
+    inst.config('[brew]\nos = 3\n')
+    assert inst.run("--status") == 1
+    assert "the 'os' key in [brew] must be a system name" in capfd.readouterr().err
+    inst.config('[brew]\nformulae = []\n\n[[brew]]\nformulae = []\n')
+    assert inst.run("--status") == 1  # TOML itself rejects mixing [brew] and [[brew]]
+
+
+def test_draft_on_linux_lists_the_apt_packages(inst, monkeypatch):
+    inst.on("linux", "ubuntu", "debian")
+    fake_apt(inst, installed=["git", "curl"])
+    text, _ = molt.install_draft_text()
+    draft = tomllib.loads(text)
+    assert draft["apt"] == {"packages": ["git", "curl"]}
+    assert "manual" not in draft and "mas" not in draft
+
+
+def test_a_missing_system_package_manager_is_another_distro(inst, capfd):
+    inst.on("linux", "ubuntu", "debian")
+    fake_apt(inst, installed=["jq"])
+    inst.config('[apt]\npackages = ["jq"]\n\n[dnf]\npackages = ["jq"]\n')
+    assert inst.run() == 0
+    out = capfd.readouterr().out.splitlines()
+    assert not any("dnf" in line for line in out)  # only --verbose shows it
+    assert out[-1] == "✓ Install completed: nothing was missing"
+    assert inst.run("--verbose") == 0
+    assert "Skipping dnf (for systems with dnf)" in capfd.readouterr().out
+
+
+def test_apt_lists_only_the_leaves_it_was_asked_for(inst):
+    inst.on("linux", "debian")
+    fake_apt(inst)
+    # Per format: the Depends one gets the package table, the status one nothing
+    fake_tool(inst.bin, "dpkg-query", r"""#!/bin/sh
+case "$3" in
+    *Depends*) printf '%s\n' \
+        'bash	yes	required	libc6 (>= 2.36), base-files' \
+        'libc6	no	optional	' \
+        'jq	no	optional	libjq1 (= 1.7), libc6' \
+        'libjq1	no	optional	libonig5 | libonig4' \
+        'vim	no	optional	vim-common:any (= 9), libc6'
+        ;;
+esac
+exit 0
+""")
+    fake_tool(inst.bin, "apt-mark", "#!/bin/sh\nprintf 'bash\\nlibc6\\njq\\nlibjq1\\nvim\\n'\n")
+    assert molt.AptGroup.requested() == ["jq", "vim"]
